@@ -18,6 +18,26 @@ pub const std_options: std.Options = .{
 
 var log_err_count: usize = 0;
 
+/// A plain (non-server-mode) run step spawns this process with stdin
+/// connected to /dev/null, which immediately reads as "closed" to any
+/// poll/select. Zig's build-runner IPC protocol instead keeps a live pipe
+/// open on the child's stdin for its whole lifetime. Some application code
+/// (see transcriptInputPending in core/app/app_render_runtime.zig) treats a
+/// closed real stdin as "input pending" and defers rendering, which fires
+/// spuriously under a plain process spawn. Replace fd 0 with the read end
+/// of a pipe whose write end is deliberately never closed, so polling
+/// stdin permanently reports "no data, not closed", matching what the
+/// server protocol's idle-but-open pipe naturally provides.
+fn detachStdinFromClosedFd() void {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return;
+    const read_fd = fds[0];
+    const write_fd = fds[1];
+    _ = std.c.dup2(read_fd, 0);
+    if (read_fd != 0) _ = std.c.close(read_fd);
+    _ = write_fd;
+}
+
 fn shardEnv(environ: std.process.Environ, comptime name: []const u8, default: u32) u32 {
     const value = std.process.Environ.getAlloc(environ, std.heap.page_allocator, name) catch |err| switch (err) {
         error.EnvironmentVariableMissing => return default,
@@ -30,6 +50,7 @@ fn shardEnv(environ: std.process.Environ, comptime name: []const u8, default: u3
 
 pub fn main(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
+    detachStdinFromClosedFd();
 
     const shard = shardEnv(init.environ, "FX_TEST_SHARD", 0);
     const shard_count = shardEnv(init.environ, "FX_TEST_SHARD_COUNT", 1);
