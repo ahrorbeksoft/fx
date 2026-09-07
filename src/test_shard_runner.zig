@@ -1,13 +1,7 @@
-//! Shard-aware test runner. Declared with `.mode = .simple` in build.zig, so
-//! `std.Build.addRunArtifact` does not enable the build-runner IPC protocol
-//! (`std.zig.Server`) for this executable at all: it runs this as a plain
-//! process and reads its exit code. That keeps this file built entirely from
-//! stable, public APIs (`builtin.test_functions`, `std.testing`, `std.Io`),
-//! with no coupling to the compiler's internal test-runner protocol.
-//!
-//! The per-test setup/teardown loop mirrors Zig's own non-server ("terminal
-//! mode") test runner, restricted to a disjoint modulo slice of
-//! `builtin.test_functions` selected via `FX_TEST_SHARD` / `FX_TEST_SHARD_COUNT`.
+//! Shard-aware test runner, run with `.mode = .simple` so it's a plain
+//! process with no build-runner IPC, built entirely from stable public APIs
+//! (`builtin.test_functions`, `std.testing`). Runs a disjoint modulo slice of
+//! `builtin.test_functions`, selected via `FX_TEST_SHARD` / `FX_TEST_SHARD_COUNT`.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -18,16 +12,11 @@ pub const std_options: std.Options = .{
 
 var log_err_count: usize = 0;
 
-/// A plain (non-server-mode) run step spawns this process with stdin
-/// connected to /dev/null, which immediately reads as "closed" to any
-/// poll/select. Zig's build-runner IPC protocol instead keeps a live pipe
-/// open on the child's stdin for its whole lifetime. Some application code
-/// (see transcriptInputPending in core/app/app_render_runtime.zig) treats a
-/// closed real stdin as "input pending" and defers rendering, which fires
-/// spuriously under a plain process spawn. Replace fd 0 with the read end
-/// of a pipe whose write end is deliberately never closed, so polling
-/// stdin permanently reports "no data, not closed", matching what the
-/// server protocol's idle-but-open pipe naturally provides.
+/// A plain process spawn gives us stdin = /dev/null, which polls as "closed".
+/// transcriptInputPending (core/app/app_render_runtime.zig) treats closed
+/// stdin as "input pending" and defers rendering, breaking tests. Replace
+/// fd 0 with a pipe whose write end we never close, so it polls as open
+/// but empty instead.
 fn detachStdinFromClosedFd() void {
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return;
@@ -107,10 +96,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 }
 
-/// std.testing.fuzz unconditionally delegates to `@import("root").fuzz`, so
-/// any custom test runner must provide this. We never run `zig build test
-/// --fuzz`, so only the non-fuzzing corpus-replay behavior is implemented,
-/// matching what Zig's own runner does when `builtin.fuzz` is false.
+/// Required because std.testing.fuzz delegates to `root.fuzz`. We never run
+/// `zig build test --fuzz`, so this only implements corpus replay, matching
+/// Zig's own runner when `builtin.fuzz` is false.
 pub fn fuzz(
     context: anytype,
     comptime testOne: fn (context: @TypeOf(context), smith: *testing.Smith) anyerror!void,
