@@ -5987,7 +5987,7 @@ test.skipIf(!tmuxAvailable())(
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 
-      await active.sendKeys("Tab");
+      await active.sendKeys("Right");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return plain.includes("Sessions 2") &&
@@ -5997,7 +5997,7 @@ test.skipIf(!tmuxAvailable())(
       const allPicker = stripAnsi(await active.capturePane());
       expect(allPicker).toContain("Save the workspace A transcript.");
       expect(allPicker).toContain("Save the workspace B transcript.");
-      expect(allPicker).toContain("tab scope");
+      expect(allPicker).toContain("tab details");
 
       await active.sendLiteralText("workspace B");
       await active.waitForPane((pane) => {
@@ -6116,6 +6116,79 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "interactive /resume expands the selected session details on tab",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-details-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    const gateway = startFakeGateway([fakeGatewayFinalText("DETAIL_TURN_SAVED")]);
+    let active: TmuxSession | null = null;
+
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 28,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save a turn for the details line.");
+      await active.waitForText("DETAIL_TURN_SAVED", TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+      const sessionId = sessionIdFromHome(home);
+      const recorded = JSON.parse(readFileSync(join(home, ".fx", "sessions", sessionId, "session.json"), "utf8"));
+
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 28,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/resume");
+      const picker = stripAnsi(await waitForSessionPicker(active));
+      expect(picker).toContain("Sessions 1");
+      expect(picker).not.toContain("created");
+      await active.waitForText("Save a turn for the details line.", TIMEOUT);
+
+      await active.sendKeys("Tab");
+      const expanded = stripAnsi(await active.waitForText("created", TIMEOUT).then(() => active.capturePane()));
+      // The path middle-ellipsizes on narrow panes; its head always survives.
+      expect(expanded).toContain(workspaceRoot.slice(0, 20));
+      expect(expanded).toContain(recorded.model);
+      expect(expanded).toContain("tab details");
+
+      await active.sendKeys("Tab");
+      await active.waitForPane(
+        (pane) => !stripAnsi(pane).includes("created"),
+        TIMEOUT,
+      );
+
+      await active.sendKeys("Escape");
+      await waitForSessionPickerClosed(active);
+      expect(active.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "interactive /resume highlight reaches bottom before the list scrolls",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-picker-row-")));
@@ -6215,7 +6288,7 @@ test.skipIf(!tmuxAvailable())(
       const atReversedSelection = (await active.capturePane()).split("\n");
       const headerRow = atReversedSelection.findIndex((line) => line.includes("Sessions 10"));
       const loadMoreRow = atReversedSelection.findIndex((line) => line.includes("↓ Load more"));
-      const hintRow = atReversedSelection.findIndex((line) => line.includes("tab scope"));
+      const hintRow = atReversedSelection.findIndex((line) => line.includes("tab details"));
       expect(headerRow).toBeGreaterThanOrEqual(0);
       expect(loadMoreRow).toBeGreaterThan(headerRow);
       expect(hintRow).toBeGreaterThan(loadMoreRow);
@@ -6231,7 +6304,7 @@ test.skipIf(!tmuxAvailable())(
       const afterFurtherScroll = (await active.capturePane()).split("\n");
       expect(afterFurtherScroll.findIndex((line) => /Sessions 1[12]\b/.test(line))).toBe(headerRow);
       expect(afterFurtherScroll.findIndex((line) => line.includes("↓ Load more"))).toBe(-1);
-      expect(afterFurtherScroll.findIndex((line) => line.includes("tab scope"))).toBe(hintRow);
+      expect(afterFurtherScroll.findIndex((line) => line.includes("tab details"))).toBe(hintRow);
       expect(visibleSessionPickerEntries(await active.capturePaneEscapes())[0]!.row).toBe(firstEntryRow);
 
       expect(active.isAlive()).toBe(true);

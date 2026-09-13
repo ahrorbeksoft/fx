@@ -397,6 +397,7 @@ test "actionable catalog preserves discovery and child visibility" {
     defer catalog.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
     try std.testing.expectEqualStrings("public", catalog.summaries.items[0].id);
+    try std.testing.expectEqualStrings("test", catalog.summaries.items[0].model.?);
     var reference = try store.list(alloc);
     defer session_summary_codec.freeSummaries(alloc, &reference);
     var visible: usize = 0;

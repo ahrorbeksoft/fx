@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
+const session_display_metadata = @import("../../core/session/session_display_metadata.zig");
 const session_store = @import("../../core/session/session_store.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
@@ -36,8 +37,50 @@ const SessionMenuLayout = struct {
     feedback_inline: bool = false,
     show_header: bool = true,
     row_count: u16 = 0,
+    /// Row under the selected item showing the detail line, when expanded.
+    detail_row: ?u16 = null,
 
     fn build(projection: SessionMenuProjection, row_budget: u16) SessionMenuLayout {
+        return applyDetailRow(buildBase(projection, row_budget), projection, row_budget);
+    }
+
+    /// The expanded detail line rides under the selected session; the items
+    /// below it and the load-more action shift down one row. When the menu
+    /// already fills its budget the list lends it one session row at a time.
+    fn applyDetailRow(layout_in: SessionMenuLayout, projection: SessionMenuProjection, row_budget: u16) SessionMenuLayout {
+        if (!projection.expanded or projection.load_state != .ready) return layout_in;
+        var layout = layout_in;
+        if (layout.visible_session_items == 0 or layout.selected >= layout.session_count) return layout_in;
+
+        while (true) {
+            const window_start = sessionWindowStart(projection, layout);
+            if (layout.selected < window_start) return layout_in;
+            const selected_visible_offset = layout.selected - window_start;
+            if (selected_visible_offset >= layout.visible_session_items) return layout_in;
+            const detail = layout.first_item_row + @as(u16, @intCast(selected_visible_offset)) * layout.item_stride + 1;
+            if (layout.feedback_row != null and detail <= layout.feedback_row.?) return layout_in;
+
+            const selected_is_last_visible = selected_visible_offset == layout.visible_session_items - 1;
+            const last_item_row = layout.first_item_row +
+                (layout.visible_session_items - 1) * layout.item_stride +
+                @intFromBool(!selected_is_last_visible);
+            const content_bottom = @max(last_item_row, detail);
+            const load_more_row: ?u16 = if (layout.load_more_row != null) content_bottom + 1 else null;
+            const needed = (load_more_row orelse content_bottom) + 1;
+            if (needed > row_budget) {
+                if (layout.visible_session_items <= 1) return layout_in;
+                layout.visible_session_items -= 1;
+                layout.visible_items -|= 1;
+                continue;
+            }
+            layout.row_count = needed;
+            layout.load_more_row = load_more_row;
+            layout.detail_row = detail;
+            return layout;
+        }
+    }
+
+    fn buildBase(projection: SessionMenuProjection, row_budget: u16) SessionMenuLayout {
         if (row_budget == 0) return .{};
 
         const session_count = projection.filteredItemCount();
@@ -231,10 +274,20 @@ pub fn composeSessionMenuRow(
     if (row_index < layout.first_item_row) return row;
     if (layout.visible_session_items == 0) return row;
 
-    const body_offset = row_index - layout.first_item_row;
+    const window_start = sessionWindowStart(projection, layout);
+
+    // The Tab-expanded detail line sits directly under the selected session.
+    var body_offset = row_index - layout.first_item_row;
+    if (layout.detail_row) |detail| {
+        if (row_index == detail) {
+            const selected_summary = projection.itemAt(window_start + (detail - layout.first_item_row -| 1)) orelse return row;
+            return composeDetailRow(alloc, selected_summary.*, projection.now_ms, width);
+        }
+        if (row_index > detail) body_offset -= 1;
+    }
+
     const visible_offset = body_offset / layout.item_stride;
     if (visible_offset >= layout.visible_session_items) return row;
-    const window_start = sessionWindowStart(projection, layout);
     const display_index = window_start + visible_offset;
     const summary = projection.itemAt(display_index) orelse return row;
 
@@ -243,6 +296,7 @@ pub fn composeSessionMenuRow(
     if (layout.feedback_inline) {
         return composeCompactFailureTitleRow(
             alloc,
+            projection,
             summary.*,
             display_index == layout.selected,
             projection.now_ms,
@@ -250,7 +304,7 @@ pub fn composeSessionMenuRow(
             width,
         );
     }
-    return composeTitleRow(alloc, summary.*, display_index == layout.selected, projection.now_ms, columns, width);
+    return composeTitleRow(alloc, projection, summary.*, display_index == layout.selected, projection.now_ms, columns, width);
 }
 
 fn sessionWindowStart(projection: SessionMenuProjection, layout: SessionMenuLayout) usize {
@@ -345,8 +399,12 @@ fn matchingColumns(projection: SessionMenuProjection) MetadataColumns {
     return cols;
 }
 
+/// git-log row order: recency, size, workspace, then the subject. The cursor
+/// row leads with ">" and renders bright; every other row indents two cells
+/// and dims, so the selection reads at a glance.
 fn composeTitleRow(
     alloc: Allocator,
+    projection: SessionMenuProjection,
     summary: session_store.SessionSummary,
     selected: bool,
     now_ms: i64,
@@ -357,60 +415,126 @@ fn composeTitleRow(
     errdefer row.deinit(alloc);
 
     const indent_width: usize = if (width <= 4) 0 else 2;
-    if (indent_width > 0) try row.appendSlice(alloc, "  ");
+    // The marker rides plain before the style so the SGR always lands inline:
+    // a style opened at the row's first cell can be deduped into a carry from
+    // the previous row, which tmux capture -J drops from the captured text.
+    if (indent_width > 0) try row.appendSlice(alloc, if (selected) "> " else "  ");
+    const style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
+    try row.appendSlice(alloc, style);
 
-    // Right cluster: "<workspace> · <age> · N turns", all dim, laid out in
-    // fixed columns. @max with the row's own widths keeps it self-sizing when
-    // no shared columns are supplied.
     var age_buf: [32]u8 = undefined;
     const age = session_catalog.relativeActivityAgeCompact(&age_buf, summary.updated_at_ms, now_ms);
     const workspace = sessionWorkspaceLabel(summary);
     var turns_buf: [32]u8 = undefined;
     const turns = sessionTurnsText(&turns_buf, summary.history_len);
-    const workspace_col = @max(columns.workspace, display_width.visibleWidth(workspace));
     const age_col = @max(columns.age, display_width.visibleWidth(age));
     const turns_col = @max(columns.turns, display_width.visibleWidth(turns));
-    const metadata_width = workspace_col + MetadataColumns.separator_width + age_col + MetadataColumns.separator_width + turns_col;
+    const workspace_col = @max(columns.workspace, display_width.visibleWidth(workspace));
+    const metadata_width = age_col + MetadataColumns.separator_width + turns_col +
+        MetadataColumns.separator_width + workspace_col + MetadataColumns.separator_width;
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
-    const content_width: usize = @as(usize, width) -| 1;
-    const metadata_overhead = prefix_width + picker_presentation.inline_picker_column_gap_width + metadata_width;
-    const available_title_width = content_width -| metadata_overhead;
-    const show_metadata = metadata_width > 0 and available_title_width >= minimum_title_column_width;
-    const measured_title_width = @max(columns.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
-    const title_col = if (show_metadata)
-        @min(measured_title_width, available_title_width)
-    else
-        @as(usize, width) -| prefix_width;
-    const metadata_start = prefix_width + title_col + picker_presentation.inline_picker_column_gap_width;
+    const title = session_catalog.displayTitle(summary);
+    const current_suffix = if (projection.current_id != null and
+        std.mem.eql(u8, projection.current_id.?, summary.id)) " · current" else "";
+    var id_buf: [8]u8 = undefined;
+    const ambiguous = ambiguousTitle(projection, title);
+    const short_id: []const u8 = if (ambiguous) shortSessionId(&id_buf, summary.id) else "";
+    const current_suffix_width = display_width.visibleWidth(current_suffix);
+    const with_meta_budget = (@as(usize, width) -| 1) -| prefix_width -| metadata_width -| current_suffix_width;
+    const show_metadata = with_meta_budget >= minimum_title_column_width;
     const title_budget = if (show_metadata)
-        title_col
+        with_meta_budget
     else
-        @as(usize, width) -| prefix_width;
-
-    // Selection is signaled by brightness: bold bright white when selected,
-    // dim gray otherwise, so the two are clearly distinct. No marker glyph.
-    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
-    try row.appendSlice(alloc, ui_render.reset_style);
+        (@as(usize, width) -| 1) -| prefix_width -| current_suffix_width;
 
     if (show_metadata) {
-        try row_text.appendSpacesToColumn(alloc, &row, metadata_start);
-        // The metadata cluster tracks the row's selection: bold bright with the
-        // selected title, dim gray otherwise, so the whole selected row stands out.
-        try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-        // Workspace and turn count left-aligned, age right-aligned: each column
-        // keeps its own digits in line. The turn count closes the row, so it
-        // needs no trailing padding.
-        try row.appendSlice(alloc, workspace);
-        try row.appendNTimes(alloc, ' ', workspace_col - display_width.visibleWidth(workspace));
-        try row.appendSlice(alloc, " · ");
+        // Age right-aligned, turns and workspace left-aligned: each column
+        // keeps its own text in line across rows.
         try row.appendNTimes(alloc, ' ', age_col - display_width.visibleWidth(age));
         try row.appendSlice(alloc, age);
         try row.appendSlice(alloc, " · ");
         try row.appendSlice(alloc, turns);
-        try row.appendSlice(alloc, ui_render.reset_style);
+        try row.appendNTimes(alloc, ' ', turns_col - display_width.visibleWidth(turns));
+        try row.appendSlice(alloc, " · ");
+        try row.appendSlice(alloc, workspace);
+        try row.appendNTimes(alloc, ' ', workspace_col - display_width.visibleWidth(workspace));
+        try row.appendSlice(alloc, " · ");
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, title, title_budget);
+    } else {
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, title, title_budget);
     }
+    if (current_suffix.len > 0) try row.appendSlice(alloc, current_suffix);
+    // The short-id suffix is best-effort: it only rides along when the full
+    // title already fits, so it never squeezes the title into an ellipsis.
+    if (short_id.len > 0 and
+        display_width.visibleWidth(title) <= title_budget and
+        display_width.visibleWidthIgnoringAnsi(row.items) + MetadataColumns.separator_width + short_id.len <= width -| 1)
+    {
+        try row.appendSlice(alloc, " · ");
+        try row.appendSlice(alloc, short_id);
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+/// The first six alphanumeric bytes of the session id, git-short-hash style.
+fn shortSessionId(buf: *[8]u8, id: []const u8) []const u8 {
+    var len: usize = 0;
+    for (id) |byte| {
+        if (len >= 6) break;
+        if (!std.ascii.isAlphanumeric(byte)) continue;
+        buf[len] = byte;
+        len += 1;
+    }
+    return buf[0..len];
+}
+
+/// Fallback and duplicated titles cannot identify a session on their own, so
+/// those rows carry their short id, like `git log --oneline`.
+fn ambiguousTitle(projection: SessionMenuProjection, title: []const u8) bool {
+    if (std.mem.eql(u8, title, session_display_metadata.fallback_title)) return true;
+    var matches: usize = 0;
+    var display_index: usize = 0;
+    while (projection.itemAt(display_index)) |summary_ptr| : (display_index += 1) {
+        if (std.mem.eql(u8, session_catalog.displayTitle(summary_ptr.*), title)) {
+            matches += 1;
+            if (matches > 1) return true;
+        }
+    }
+    return false;
+}
+
+/// Tab-expanded detail line: the full workspace path, the recorded model, and
+/// when the session was created — everything the one-line row cannot show.
+fn composeDetailRow(
+    alloc: Allocator,
+    summary: session_store.SessionSummary,
+    now_ms: i64,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    const indent_width: usize = if (width <= 8) 0 else 4;
+    if (indent_width > 0) try row.appendNTimes(alloc, ' ', indent_width);
+    try row.appendSlice(alloc, ui_render.dim_style);
+
+    const budget = @as(usize, width) -| indent_width;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    try line.appendSlice(alloc, session_catalog.workspacePath(summary));
+    if (summary.model) |model| {
+        if (model.len > 0) {
+            try line.appendSlice(alloc, " · ");
+            try line.appendSlice(alloc, model);
+        }
+    }
+    var age_buf: [32]u8 = undefined;
+    try line.appendSlice(alloc, " · created ");
+    try line.appendSlice(alloc, session_catalog.relativeActivityAgeCompact(&age_buf, summary.created_at_ms, now_ms));
+    // Middle-ellipsize: long paths must not cut the model and created tail.
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, line.items, budget);
+    try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
@@ -477,6 +601,7 @@ fn composeSelectionFailureRow(
 
 fn composeCompactFailureTitleRow(
     alloc: Allocator,
+    projection: SessionMenuProjection,
     summary: session_store.SessionSummary,
     selected: bool,
     now_ms: i64,
@@ -488,6 +613,7 @@ fn composeCompactFailureTitleRow(
     const suffix_width = @min(width, retry_width);
     var row = try composeTitleRow(
         alloc,
+        projection,
         summary,
         selected,
         now_ms,
@@ -551,7 +677,7 @@ test "resume menu starts every turn count in the same column" {
     );
 }
 
-test "resume menu renders each session on one line with a right metadata cluster" {
+test "resume menu renders each session on one line with the metadata leading" {
     const alloc = std.testing.allocator;
     const summaries = [_]session_store.SessionSummary{.{
         .id = @constCast("one"),
@@ -578,12 +704,11 @@ test "resume menu renders each session on one line with a right metadata cluster
 
     var title = try composeSessionMenuRow(alloc, projection, 2, 120, 4);
     defer title.deinit(alloc);
-    // Single line, no selection marker: title plus the dim right cluster
-    // "<workspace> · <age> · N turns" using the workspace basename.
+    // Single line: "> " cursor, then age, turns, and the workspace basename
+    // leading the title, git-log style.
     try std.testing.expect(std.mem.find(u8, title.items, "Redesign resume menu") != null);
-    try std.testing.expect(std.mem.find(u8, title.items, "resume-catalog · 8m · 24 turns") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "8m · 24 turns · resume-catalog · Redesign resume menu") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
 }
 
 test "resume menu renders loading empty and failure states" {
@@ -764,21 +889,27 @@ test "resume menu keeps shared-prefix session titles distinguishable when narrow
         .conversation_language = .literal("en"),
         .history_len = 1,
     };
+    const summaries = [_]session_store.SessionSummary{ alpha, beta };
+    const projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+    };
 
-    var alpha_row = try composeTitleRow(alloc, alpha, true, 1, .{}, 64);
+    var alpha_row = try composeTitleRow(alloc, projection, alpha, true, 1, .{}, 64);
     defer alpha_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, alpha_row.items, "Shared p") != null);
     try std.testing.expect(std.mem.find(u8, alpha_row.items, "n alpha") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(alpha_row.items) <= 64);
 
-    var beta_row = try composeTitleRow(alloc, beta, false, 1, .{}, 64);
+    var beta_row = try composeTitleRow(alloc, projection, beta, false, 1, .{}, 64);
     defer beta_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, beta_row.items, "Shared p") != null);
     try std.testing.expect(std.mem.find(u8, beta_row.items, "on beta") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(beta_row.items) <= 64);
 }
 
-test "resume menu metadata follows the widest matching title across windows" {
+test "resume menu metadata columns stay fixed across windows" {
     const alloc = std.testing.allocator;
     const now_ms = 2 * std.time.ms_per_min;
     const summaries = [_]session_store.SessionSummary{
@@ -824,10 +955,7 @@ test "resume menu metadata follows the widest matching title across windows" {
     const second_turns = std.mem.find(u8, second.items, "100 turns") orelse
         return error.ExpectedSecondTurnCount;
 
-    try std.testing.expectEqual(
-        @as(usize, 19),
-        display_width.visibleWidthIgnoringAnsi(first.items[0..first_workspace]),
-    );
+    // The metadata columns do not depend on the title's width.
     try std.testing.expectEqual(
         display_width.visibleWidthIgnoringAnsi(first.items[0..first_workspace]),
         display_width.visibleWidthIgnoringAnsi(second.items[0..second_workspace]),
@@ -1011,4 +1139,105 @@ test "resume menu keeps the selected paginated action visible in two rows" {
     var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_load_more.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
+}
+
+test "resume menu keeps the detail line hidden until expanded" {
+    const alloc = std.testing.allocator;
+    const summaries = [_]session_store.SessionSummary{.{
+        .id = @constCast("one"),
+        .workspace_root = @constCast("/Users/example/Developer/Fx"),
+        .title = @constCast("Detail session"),
+        .model = @constCast("anthropic/test-model"),
+        .created_at_ms = 1,
+        .updated_at_ms = std.time.ms_per_min,
+        .conversation_language = .literal("en"),
+        .history_len = 7,
+    }};
+    const collapsed: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .now_ms = 2 * std.time.ms_per_min,
+    };
+    try std.testing.expectEqual(@as(u16, 3), menuRowCount(collapsed, 100, 12));
+
+    var expanded = collapsed;
+    expanded.expanded = true;
+    // The detail line grows the menu by one row and renders under the cursor.
+    try std.testing.expectEqual(@as(u16, 4), menuRowCount(expanded, 100, 12));
+    var detail = try composeSessionMenuRow(alloc, expanded, 3, 100, 12);
+    defer detail.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, detail.items, "/Users/example/Developer/Fx") != null);
+    try std.testing.expect(std.mem.find(u8, detail.items, "anthropic/test-model") != null);
+    try std.testing.expect(std.mem.find(u8, detail.items, "created") != null);
+
+    // The item below the detail line is unaffected when the cursor stays put.
+    var item = try composeSessionMenuRow(alloc, expanded, 2, 100, 12);
+    defer item.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, item.items, "Detail session") != null);
+}
+
+test "resume menu marks the current session and disambiguates repeated titles" {
+    const alloc = std.testing.allocator;
+    const summaries = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("sess-alpha-1"),
+            .workspace_root = @constCast("/workspace"),
+            .title = @constCast("Untitled session"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("sess-beta-2"),
+            .workspace_root = @constCast("/workspace"),
+            .title = @constCast("Untitled session"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = .literal("en"),
+            .history_len = 2,
+        },
+    };
+    const projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .current_id = "sess-beta-2",
+        .now_ms = 2 * std.time.ms_per_min,
+    };
+
+    var first = try composeSessionMenuRow(alloc, projection, 2, 120, 5);
+    defer first.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, first.items, "Untitled session") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "sessal") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "current") == null);
+
+    var second = try composeSessionMenuRow(alloc, projection, 3, 120, 5);
+    defer second.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, second.items, "Untitled session") != null);
+    try std.testing.expect(std.mem.find(u8, second.items, "sessbe") != null);
+    try std.testing.expect(std.mem.find(u8, second.items, "current") != null);
+
+    // A unique, real title needs neither suffix.
+    const unique = [_]session_store.SessionSummary{.{
+        .id = @constCast("sess-gamma-3"),
+        .workspace_root = @constCast("/workspace"),
+        .title = @constCast("Unique title"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = .literal("en"),
+        .history_len = 1,
+    }};
+    const unique_projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &unique,
+        .now_ms = 2 * std.time.ms_per_min,
+    };
+    var row = try composeSessionMenuRow(alloc, unique_projection, 2, 120, 5);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "Unique title") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "sessga") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "current") == null);
 }
