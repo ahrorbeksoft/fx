@@ -4300,7 +4300,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "interactive resume shows session contention and retries the preserved selection",
+  "interactive resume hides sessions open elsewhere and lists them once closed",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-interactive-contention-")));
     const home = join(root, "home");
@@ -4343,38 +4343,29 @@ test.skipIf(!tmuxAvailable())(
       await contender.waitForComposer(TIMEOUT);
       await contender.sendText("/resume");
       await waitForSessionPicker(contender);
-      await contender.waitForText(savedTitle, TIMEOUT);
-      const contentionStartedAt = Date.now();
-      await contender.sendKeys("Enter");
+      // The session held by the owner never appears as resumable.
       await contender.waitForPane(
-        (pane) => stripAnsi(pane).includes(
-          "This session is open in another fx. Close it there, then press enter to retry.",
-        ),
-        1_000,
+        (pane) => stripAnsi(pane).includes("No sessions found"),
+        TIMEOUT,
       );
-      expect(Date.now() - contentionStartedAt).toBeLessThan(1_000);
-
-      const contendedPicker = stripAnsi(await contender.capturePane());
-      expect(contendedPicker).toContain(savedTitle);
-      expect(contendedPicker).toContain(
-        "This session is open in another fx. Close it there, then press enter to retry.",
-      );
-      expect(contendedPicker).not.toContain("SessionBusy");
-      const contendedEntries = visibleSessionPickerEntries(
-        await contender.capturePaneEscapes(),
-      );
-      expect(contendedEntries).toHaveLength(1);
-      expect(contendedEntries[0]!.selected).toBe(true);
+      expect(stripAnsi(await contender.capturePane())).not.toContain(savedTitle);
       expect(owner.isPaneAlive()).toBe(true);
       expect(contender.isPaneAlive()).toBe(true);
       expect(readFileSync(ownerStderrPath, "utf8")).toBe("");
       expect(readFileSync(contenderStderrPath, "utf8")).toBe("");
 
+      await contender.sendKeys("Escape");
+      await waitForSessionPickerClosed(contender);
       await owner.sendText("/quit");
       expect(await owner.waitForSessionEnd()).toBe(true);
       await owner.kill();
       owner = null;
 
+      // Once the owner lets go, the next catalog load lists the session.
+      await new Promise((resolve) => setTimeout(resolve, 6_000));
+      await contender.sendText("/resume");
+      await waitForSessionPicker(contender);
+      await contender.waitForText(savedTitle, TIMEOUT);
       await contender.sendKeys("Enter");
       const resumed = await waitForScrollback(contender, savedMarker);
       expect(resumed).toContain(`* session resumed: ${savedTitle}`);
