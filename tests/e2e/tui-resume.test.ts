@@ -5971,7 +5971,10 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
       await waitForSessionPicker(active);
-      const currentPicker = stripAnsi(await active.capturePane());
+      const currentPicker = stripAnsi(await active.waitForPane((pane) => {
+        const plain = stripAnsi(pane);
+        return plain.includes("Sessions 1") && plain.includes("Save the workspace A transcript.");
+      }, TIMEOUT));
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
       expect(currentPicker).toContain("𝒇x");
@@ -6107,7 +6110,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "interactive /resume expands the selected session details on tab",
+  "interactive /resume expands the selected session details with the arrow keys",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-details-")));
     const home = join(root, "home");
@@ -6148,10 +6151,13 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/resume");
-      const picker = stripAnsi(await waitForSessionPicker(active));
+      await waitForSessionPicker(active);
+      const picker = stripAnsi(await active.waitForPane((pane) => {
+        const plain = stripAnsi(pane);
+        return plain.includes("Sessions 1") && plain.includes("Save a turn for the details line.");
+      }, TIMEOUT));
       expect(picker).toContain("Sessions 1");
       expect(picker).not.toContain("created");
-      await active.waitForText("Save a turn for the details line.", TIMEOUT);
 
       await active.sendKeys("Right");
       const expanded = stripAnsi(await active.waitForText("created", TIMEOUT).then(() => active.capturePane()));
