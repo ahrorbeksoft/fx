@@ -228,8 +228,6 @@ pub const SessionMenuProjection = struct {
     /// Tab expands the selected row into a detail line; hidden by default.
     expanded: bool = false,
     /// The session the user is currently inside, marked so it is not resumed onto itself.
-    current_id: ?[]const u8 = null,
-
     pub fn filteredItemCount(self: SessionMenuProjection) usize {
         return session_catalog.filteredCount(self.summaries, self.query);
     }

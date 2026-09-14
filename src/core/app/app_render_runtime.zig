@@ -789,7 +789,6 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = now_ms,
                     .selection_failure = app.session_persistence.session_picker.selection_failure,
                     .expanded = app.session_persistence.session_picker.expanded,
-                    .current_id = if (app.session_persistence.writable) |*loaded| loaded.active_id else null,
                 } else .{},
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
