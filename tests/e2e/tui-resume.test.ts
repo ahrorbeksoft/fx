@@ -353,7 +353,8 @@ async function waitForSessionPicker(session: TmuxSession): Promise<string> {
     (pane) => {
       const plain = stripAnsi(pane);
       return plain.includes("Sessions") &&
-        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]"));
+        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]")) &&
+        !plain.includes("Loading sessions");
     },
     TIMEOUT,
   );
