@@ -255,15 +255,14 @@ pub fn Runtime(comptime App: type) type {
         fn routeComposerShortcutAction(app: *App, action: input_action.ShortcutAction, max_input_len: usize) !void {
             switch (action) {
                 .move => |intent| {
-                    // In the session picker the arrows switch scope, matching
-                    // the settings catalog; the filter query keeps no cursor
-                    // movement while the menu owns the footer.
+                    // In the session picker the arrows own the detail line,
+                    // file-tree style: Right expands, Left collapses.
                     if (!intent.extend_selection and
                         (intent.kind == .character_left or intent.kind == .character_right) and
                         sessionMenuActive(app))
                     {
                         app.input_runtime.vertical_navigation.reset();
-                        if (try toggleSessionPickerScopeIfActive(app)) {
+                        if (setSessionPickerDetailsExpandedIfActive(app, intent.kind == .character_right)) {
                             app.shell.render_requests.request(.footer);
                         }
                         return;
@@ -1430,8 +1429,6 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (moveAuthPickerIfActive(app, 1)) {
                         app.shell.render_requests.request(.footer);
-                    } else if (toggleSessionPickerDetailsIfActive(app)) {
-                        app.shell.render_requests.request(.footer);
                     } else if (try toggleSessionPickerScopeIfActive(app)) {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, 1) or cycleSkillsMenuSource(app, 1)) {
@@ -2332,9 +2329,9 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn toggleSessionPickerDetailsIfActive(app: *App) bool {
+        fn setSessionPickerDetailsExpandedIfActive(app: *App, expanded: bool) bool {
             if (comptime !@hasField(App, "session_persistence")) return false;
-            return app_session_runtime.Runtime(App).toggleSessionPickerDetails(app);
+            return app_session_runtime.Runtime(App).setSessionPickerDetailsExpanded(app, expanded);
         }
 
         fn toggleSessionPickerScopeIfActive(app: *App) !bool {
@@ -5308,7 +5305,7 @@ test "app_input_runtime Tab cycles usage scopes in both directions" {
     try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
 }
 
-test "app_input_runtime arrows toggle session picker scope while Tab owns details" {
+test "app_input_runtime Tab toggles session picker scope while arrows own details" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5327,16 +5324,17 @@ test "app_input_runtime arrows toggle session picker scope while Tab owns detail
     app.session_persistence.session_picker.scope = .current_workspace;
     try app.input_runtime.textReplacementState().replace(alloc, "/sk");
 
-    // Tab owns the detail expand while the picker is open; the scope lives on
-    // the arrow keys.
+    // Tab keeps its scope job; the arrows take the detail line.
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try std.testing.expect(app.session_persistence.session_picker.active);
-    try std.testing.expectEqual(app_session_runtime.SessionPickerScope.current_workspace, app.session_persistence.session_picker.scope);
+    try std.testing.expectEqual(app_session_runtime.SessionPickerScope.all_workspaces, app.session_persistence.session_picker.scope);
     try std.testing.expectEqualStrings("/sk", app.input_runtime.edit_state.input.items);
 
-    // A plain Left arrow switches scope.
-    try feedRoutingBytes(&app, "\x1b[D");
+    // A plain Right arrow while the list is still loading is held, not leaked
+    // into the composer.
+    try feedRoutingBytes(&app, "\x1b[C");
     try std.testing.expectEqual(app_session_runtime.SessionPickerScope.all_workspaces, app.session_persistence.session_picker.scope);
+    try std.testing.expect(!app.session_persistence.session_picker.expanded);
     try std.testing.expectEqualStrings("/sk", app.input_runtime.edit_state.input.items);
 }
 

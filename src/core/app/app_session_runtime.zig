@@ -1993,13 +1993,15 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        pub fn toggleSessionPickerDetails(app: *App) bool {
+        /// Right expands the selected row's detail line, Left collapses it —
+        /// the file-tree idiom. Returns false when the picker is closed.
+        pub fn setSessionPickerDetailsExpanded(app: *App, expanded: bool) bool {
             const picker = &app.session_persistence.session_picker;
             if (!picker.active) return false;
-            // Tab belongs to the picker while it owns the footer; details
-            // toggle only once a session row is actually selectable.
+            // Arrows belong to the picker while it owns the footer; details
+            // respond only once a session row is actually selectable.
             if (picker.load_state == .ready and picker.selectedId() != null) {
-                picker.expanded = !picker.expanded;
+                picker.expanded = expanded;
             }
             return true;
         }

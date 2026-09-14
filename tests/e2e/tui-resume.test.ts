@@ -5987,7 +5987,7 @@ test.skipIf(!tmuxAvailable())(
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 
-      await active.sendKeys("Right");
+      await active.sendKeys("Tab");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return plain.includes("Sessions 2") &&
@@ -5997,7 +5997,7 @@ test.skipIf(!tmuxAvailable())(
       const allPicker = stripAnsi(await active.capturePane());
       expect(allPicker).toContain("Save the workspace A transcript.");
       expect(allPicker).toContain("Save the workspace B transcript.");
-      expect(allPicker).toContain("tab details");
+      expect(allPicker).toContain("tab scope");
 
       await active.sendLiteralText("workspace B");
       await active.waitForPane((pane) => {
@@ -6162,14 +6162,14 @@ test.skipIf(!tmuxAvailable())(
       expect(picker).not.toContain("created");
       await active.waitForText("Save a turn for the details line.", TIMEOUT);
 
-      await active.sendKeys("Tab");
+      await active.sendKeys("Right");
       const expanded = stripAnsi(await active.waitForText("created", TIMEOUT).then(() => active.capturePane()));
       // The path middle-ellipsizes on narrow panes; its head always survives.
       expect(expanded).toContain(workspaceRoot.slice(0, 20));
       expect(expanded).toContain(recorded.model);
-      expect(expanded).toContain("tab details");
+      expect(expanded).toContain("→ details");
 
-      await active.sendKeys("Tab");
+      await active.sendKeys("Left");
       await active.waitForPane(
         (pane) => !stripAnsi(pane).includes("created"),
         TIMEOUT,
@@ -6288,7 +6288,7 @@ test.skipIf(!tmuxAvailable())(
       const atReversedSelection = (await active.capturePane()).split("\n");
       const headerRow = atReversedSelection.findIndex((line) => line.includes("Sessions 10"));
       const loadMoreRow = atReversedSelection.findIndex((line) => line.includes("↓ Load more"));
-      const hintRow = atReversedSelection.findIndex((line) => line.includes("tab details"));
+      const hintRow = atReversedSelection.findIndex((line) => line.includes("tab scope"));
       expect(headerRow).toBeGreaterThanOrEqual(0);
       expect(loadMoreRow).toBeGreaterThan(headerRow);
       expect(hintRow).toBeGreaterThan(loadMoreRow);
@@ -6304,7 +6304,7 @@ test.skipIf(!tmuxAvailable())(
       const afterFurtherScroll = (await active.capturePane()).split("\n");
       expect(afterFurtherScroll.findIndex((line) => /Sessions 1[12]\b/.test(line))).toBe(headerRow);
       expect(afterFurtherScroll.findIndex((line) => line.includes("↓ Load more"))).toBe(-1);
-      expect(afterFurtherScroll.findIndex((line) => line.includes("tab details"))).toBe(hintRow);
+      expect(afterFurtherScroll.findIndex((line) => line.includes("tab scope"))).toBe(hintRow);
       expect(visibleSessionPickerEntries(await active.capturePaneEscapes())[0]!.row).toBe(firstEntryRow);
 
       expect(active.isAlive()).toBe(true);

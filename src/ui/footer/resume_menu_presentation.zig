@@ -415,10 +415,10 @@ fn composeTitleRow(
     errdefer row.deinit(alloc);
 
     const indent_width: usize = if (width <= 4) 0 else 2;
-    // The marker rides plain before the style so the SGR always lands inline:
+    // The indent rides plain before the style so the SGR always lands inline:
     // a style opened at the row's first cell can be deduped into a carry from
     // the previous row, which tmux capture -J drops from the captured text.
-    if (indent_width > 0) try row.appendSlice(alloc, if (selected) "> " else "  ");
+    if (indent_width > 0) try row.appendSlice(alloc, "  ");
     const style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
     try row.appendSlice(alloc, style);
 

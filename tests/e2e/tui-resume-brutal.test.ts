@@ -473,13 +473,13 @@ async function thrash(
     }
     await time(
       metrics.scope,
-      () => session.sendKeys("Right"),
+      () => session.sendKeys("Tab"),
       () => waitForMenu(session, FOREIGN_TITLE, "All workspaces"),
     );
     if (cycle === 0) expect(metrics.scope[0]).toBeLessThan(2_000);
     await time(
       metrics.scope,
-      () => session.sendKeys("Right"),
+      () => session.sendKeys("Tab"),
       () => waitForMenu(session, REAL_TITLE, "Current workspace"),
     );
     if (cycle % 4 === 0) await loadNextPage(session, metrics);
