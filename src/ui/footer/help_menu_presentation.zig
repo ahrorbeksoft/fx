@@ -32,32 +32,35 @@ const Layout = struct {
 };
 
 pub const PreparedHelpMenu = struct {
-    projection: *const HelpMenuProjection,
     layout: Layout,
     width: u16,
     row_budget: u16,
     description_column: usize,
 
-    pub noinline fn composeRow(self: PreparedHelpMenu, alloc: Allocator, row_index: u16) !std.ArrayList(u8) {
+    pub noinline fn composeRow(
+        self: PreparedHelpMenu,
+        alloc: Allocator,
+        projection: *const HelpMenuProjection,
+        row_index: u16,
+    ) !std.ArrayList(u8) {
         const empty: std.ArrayList(u8) = .empty;
         if (self.width == 0 or row_index >= self.row_budget) return empty;
         if (row_index < self.layout.body_start_row) {
-            if (row_index == 0) return composeHeaderRow(alloc, self.projection.*, self.width, self.layout.match_count);
+            if (row_index == 0) return composeHeaderRow(alloc, projection.*, self.width, self.layout.match_count);
             return empty;
         }
         if (self.layout.match_count == 0) return composeEmptyRow(alloc, self.width);
-        return switch (bodyRowAt(self.projection.*, self.layout, row_index - self.layout.body_start_row)) {
+        return switch (bodyRowAt(projection.*, self.layout, row_index - self.layout.body_start_row)) {
             .none => empty,
             .item => |item| composeCommandRow(alloc, item.spec.*, item.selected, self.width, self.description_column),
         };
     }
 };
 
-/// Borrows the frame's projection; its registry and filter must remain stable.
+/// Captures layout scalars; row composition borrows the matching frame projection.
 pub fn prepareHelpMenu(projection: *const HelpMenuProjection, width: u16, row_budget: u16) PreparedHelpMenu {
     const layout = if (width == 0) Layout{} else buildLayout(projection.*, row_budget);
     return .{
-        .projection = projection,
         .layout = layout,
         .width = width,
         .row_budget = row_budget,
@@ -262,6 +265,12 @@ const help_menu_test_specs = [_]command_specs.SlashSpec{
 };
 const help_menu_test_registry = command_specs.SlashRegistry{ .commands = help_menu_test_specs[0..] };
 
+test "prepared help layout does not retain caller storage" {
+    inline for (std.meta.fields(PreparedHelpMenu)) |field| {
+        try std.testing.expect(@typeInfo(field.type) != .pointer);
+    }
+}
+
 test "help menu preserves a partial end window with a larger row budget" {
     const projection: HelpMenuProjection = .{
         .active = true,
@@ -271,7 +280,7 @@ test "help menu preserves a partial end window with a larger row budget" {
     };
     try std.testing.expectEqual(@as(u16, 3), menuRowCount(projection, 80, 22));
     try std.testing.expectEqual(@as(u16, 1), visibleNavigationItemsForBudget(projection, 80, 22));
-    var row = try prepareHelpMenu(&projection, 80, 22).composeRow(std.testing.allocator, 2);
+    var row = try prepareHelpMenu(&projection, 80, 22).composeRow(std.testing.allocator, &projection, 2);
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "/paste") != null);
 }
@@ -285,9 +294,9 @@ test "help menu scrolls only far enough to reveal the selected command" {
     }
     const projection: HelpMenuProjection = .{ .active = true, .registry = .{ .commands = &specs }, .selected_index = 21 };
     const prepared = prepareHelpMenu(&projection, 80, 8);
-    var first = try prepared.composeRow(std.testing.allocator, 2);
+    var first = try prepared.composeRow(std.testing.allocator, &projection, 2);
     defer first.deinit(std.testing.allocator);
-    var last = try prepared.composeRow(std.testing.allocator, 7);
+    var last = try prepared.composeRow(std.testing.allocator, &projection, 7);
     defer last.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, first.items, "/c16") != null);
     try std.testing.expect(std.mem.find(u8, last.items, "/c21") != null);
@@ -303,23 +312,23 @@ test "prepared help menu preserves frame selection and tight row budgets" {
     };
     const prepared = prepareHelpMenu(&projection, 40, 3);
     projection.selected_index = 0;
-    var selected = try prepared.composeRow(alloc, 2);
+    var selected = try prepared.composeRow(alloc, &projection, 2);
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected.items, "/paste") != null);
     try std.testing.expect(std.mem.find(u8, selected.items, ui_render.selected_completion_style) != null);
 
-    var outside = try prepared.composeRow(alloc, 3);
+    var outside = try prepared.composeRow(alloc, &projection, 3);
     defer outside.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), outside.items.len);
 
     const next = prepareHelpMenu(&projection, 40, 1);
-    var first = try next.composeRow(alloc, 0);
+    var first = try next.composeRow(alloc, &projection, 0);
     defer first.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, first.items, "/help") != null);
     try std.testing.expect(std.mem.find(u8, first.items, "Commands") == null);
 
     const zero_width = prepareHelpMenu(&projection, 0, 3);
-    var empty = try zero_width.composeRow(alloc, 0);
+    var empty = try zero_width.composeRow(alloc, &projection, 0);
     defer empty.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), empty.items.len);
 }
@@ -334,11 +343,11 @@ test "help menu places descriptions after the widest matching command" {
     const rows = menuRowCount(projection, 160, 20);
     const prepared = prepareHelpMenu(&projection, 160, rows);
 
-    var header = try prepared.composeRow(alloc, 0);
+    var header = try prepared.composeRow(alloc, &projection, 0);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "Commands 3") != null);
 
-    var selected = try prepared.composeRow(alloc, 2);
+    var selected = try prepared.composeRow(alloc, &projection, 2);
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected.items, "/help") != null);
     try std.testing.expect(std.mem.find(u8, selected.items, "●") == null);
@@ -358,7 +367,7 @@ test "help menu places descriptions after the widest matching command" {
     const narrow_rows = menuRowCount(projection, 22, 20);
     try std.testing.expectEqual(rows, narrow_rows);
     try std.testing.expectEqual(@as(usize, 13), descriptionColumn(projection, 22));
-    var narrow = try prepareHelpMenu(&projection, 22, narrow_rows).composeRow(alloc, 2);
+    var narrow = try prepareHelpMenu(&projection, 22, narrow_rows).composeRow(alloc, &projection, 2);
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow.items, "/help") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 22);
@@ -375,7 +384,7 @@ test "help menu keeps a four column gutter after command names" {
         .registry = .{ .commands = long_specs[0..] },
     };
     const rows = menuRowCount(projection, 160, 12);
-    var item = try prepareHelpMenu(&projection, 160, rows).composeRow(alloc, 2);
+    var item = try prepareHelpMenu(&projection, 160, rows).composeRow(alloc, &projection, 2);
     defer item.deinit(alloc);
 
     const description_start = std.mem.find(u8, item.items, "choose permission behavior").?;
@@ -395,7 +404,7 @@ test "help menu search keeps headings non-selectable and reports empty results" 
     const rows = menuRowCount(projection, 80, 12);
     try std.testing.expectEqual(@as(u16, 3), rows);
 
-    var item = try prepareHelpMenu(&projection, 80, rows).composeRow(alloc, 2);
+    var item = try prepareHelpMenu(&projection, 80, rows).composeRow(alloc, &projection, 2);
     defer item.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, item.items, "/paste") != null);
 
@@ -405,7 +414,7 @@ test "help menu search keeps headings non-selectable and reports empty results" 
         .query = "no command can match this query",
     };
     const empty_rows = menuRowCount(empty_projection, 80, 12);
-    var empty = try prepareHelpMenu(&empty_projection, 80, empty_rows).composeRow(alloc, empty_rows - 1);
+    var empty = try prepareHelpMenu(&empty_projection, 80, empty_rows).composeRow(alloc, &empty_projection, empty_rows - 1);
     defer empty.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, empty.items, "No commands found.") != null);
 }
@@ -424,7 +433,7 @@ test "help menu renders category tabs and flat commands through the VT" {
     defer grid.deinit();
     var row_index: u16 = 0;
     while (row_index < rows) : (row_index += 1) {
-        var row = try prepared.composeRow(alloc, row_index);
+        var row = try prepared.composeRow(alloc, &projection, row_index);
         defer row.deinit(alloc);
         var cursor_buf: [32]u8 = undefined;
         const cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
@@ -464,7 +473,7 @@ test "help menu packs more filters while preserving a far active filter in the V
         .active = true,
         .registry = registry,
     };
-    var all_row = try prepareHelpMenu(&all_projection, width, 8).composeRow(alloc, 0);
+    var all_row = try prepareHelpMenu(&all_projection, width, 8).composeRow(alloc, &all_projection, 0);
     defer all_row.deinit(alloc);
     var all_grid = try vt_emulator.Grid.init(alloc, width, 1);
     defer all_grid.deinit();
@@ -482,7 +491,7 @@ test "help menu packs more filters while preserving a far active filter in the V
         .category = .product,
         .registry = registry,
     };
-    var product_row = try prepareHelpMenu(&product_projection, width, 8).composeRow(alloc, 0);
+    var product_row = try prepareHelpMenu(&product_projection, width, 8).composeRow(alloc, &product_projection, 0);
     defer product_row.deinit(alloc);
     var product_grid = try vt_emulator.Grid.init(alloc, width, 1);
     defer product_grid.deinit();
