@@ -594,13 +594,9 @@ fn gatewayBaseUrl() []const u8 {
     const override = io_mod.getenv("FX_GATEWAY_BASE_URL") orelse return default_gateway_base_url;
     // The base URL carries the bearer token; only a loopback HTTP origin is
     // trusted for local testing.
-    if (loopbackHttpOrigin(override)) |origin| {
-        return origin;
-    }
-    {
-        debug_trace.logf("stream", "ignoring FX_GATEWAY_BASE_URL: not loopback http", .{});
-        return default_gateway_base_url;
-    }
+    if (loopbackHttpOrigin(override)) |origin| return origin;
+    debug_trace.logf("stream", "ignoring FX_GATEWAY_BASE_URL: not loopback http", .{});
+    return default_gateway_base_url;
 }
 
 pub fn generationBaseUrl() []const u8 {
