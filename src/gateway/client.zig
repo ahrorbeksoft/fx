@@ -592,13 +592,15 @@ test "gateway JSON transport preserves non-success HTTP status" {
 
 fn gatewayBaseUrl() []const u8 {
     const override = io_mod.getenv("FX_GATEWAY_BASE_URL") orelse return default_gateway_base_url;
-    // The base URL carries the bearer token; only a loopback HTTP override is
+    // The base URL carries the bearer token; only a loopback HTTP origin is
     // trusted for local testing.
-    if (!isLoopbackHttpUrl(override)) {
+    if (loopbackHttpOrigin(override)) |origin| {
+        return origin;
+    }
+    {
         debug_trace.logf("stream", "ignoring FX_GATEWAY_BASE_URL: not loopback http", .{});
         return default_gateway_base_url;
     }
-    return override;
 }
 
 pub fn generationBaseUrl() []const u8 {
@@ -2197,6 +2199,17 @@ pub fn isLoopbackHttpUrl(url: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1") or
         std.ascii.eqlIgnoreCase(host, "localhost") or
         std.mem.eql(u8, host, "[::1]");
+}
+
+pub fn loopbackHttpOrigin(url: []const u8) ?[]const u8 {
+    if (!isLoopbackHttpUrl(url)) return null;
+    const uri = std.Uri.parse(url) catch return null;
+    if (uri.query != null or uri.fragment != null) return null;
+    const rest = url[uri.scheme.len + 1 ..];
+    if (!std.mem.startsWith(u8, rest, "//")) return null;
+    const authority_start = uri.scheme.len + 3;
+    const authority_end = authority_start + (std.mem.findScalar(u8, url[authority_start..], '/') orelse url.len - authority_start);
+    return url[0..authority_end];
 }
 
 const HeaderMatch = struct {
@@ -4632,6 +4645,18 @@ test "E2E gateway URL override accepts loopback HTTP only" {
         error.InvalidE2EGatewayUrl,
         selectE2eGatewayUrl("http://127.0.0.1:43123@ai-gateway.vercel.sh/v4/ai/language-model", "https://ai-gateway.vercel.sh/v4/ai/language-model"),
     );
+}
+
+test "loopbackHttpOrigin strips path prefixes from loopback base URLs" {
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:43123",
+        loopbackHttpOrigin("http://127.0.0.1:43123/xt/v4/ai/language-model").?,
+    );
+    try std.testing.expectEqualStrings(
+        "http://localhost:43123",
+        loopbackHttpOrigin("http://localhost:43123/xt").?,
+    );
+    try std.testing.expect(loopbackHttpOrigin("http://127.0.0.1:43123?path=/xt") == null);
 }
 
 test "StreamResult.deinit frees owned completion fields" {

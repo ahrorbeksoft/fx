@@ -2269,6 +2269,10 @@ test "built-in model catalog owns default and loopback target resolution" {
     defer std.testing.allocator.free(loopback_url);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/coding-agent/v1/models", loopback_url);
 
+    const pathful_loopback_url = try modelCatalogUrl(std.testing.allocator, models_path, "http://127.0.0.1:43123/xt");
+    defer std.testing.allocator.free(pathful_loopback_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/coding-agent/v1/models", pathful_loopback_url);
+
     const rejected_url = try modelCatalogUrl(std.testing.allocator, models_path, "https://gateway.example");
     defer std.testing.allocator.free(rejected_url);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/coding-agent/v1/models", rejected_url);
@@ -2543,7 +2547,7 @@ test "catalog request failures preserve transport and cancellation facts" {
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
     const base_url = if (base_url_override) |candidate| blk: {
-        if (gateway_client.isLoopbackHttpUrl(candidate)) break :blk candidate;
+        if (gateway_client.loopbackHttpOrigin(candidate)) |origin| break :blk origin;
         debug_trace.logf("gateway", "ignoring {s}: not loopback http", .{base_url_env});
         break :blk default_model_catalog_base_url;
     } else default_model_catalog_base_url;
