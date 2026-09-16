@@ -1,7 +1,4 @@
-//! Shard-aware test runner, run with `.mode = .simple` so it's a plain
-//! process with no build-runner IPC, built entirely from stable public APIs
-//! (`builtin.test_functions`, `std.testing`). Runs a disjoint modulo slice of
-//! `builtin.test_functions`, selected via `FX_TEST_SHARD` / `FX_TEST_SHARD_COUNT`.
+//! Runs modulo test slices as plain processes selected by `FX_TEST_SHARD` and `FX_TEST_SHARD_COUNT`.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -12,11 +9,7 @@ pub const std_options: std.Options = .{
 
 var log_err_count: usize = 0;
 
-/// A plain process spawn gives us stdin = /dev/null, which polls as "closed".
-/// transcriptInputPending (core/app/app_render_runtime.zig) treats closed
-/// stdin as "input pending" and defers rendering, breaking tests. Replace
-/// fd 0 with a pipe whose write end we never close, so it polls as open
-/// but empty instead.
+/// Keeps stdin open but empty so render tests do not treat `/dev/null` as pending input.
 fn detachStdinFromClosedFd() void {
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return;
@@ -96,9 +89,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 }
 
-/// Required because std.testing.fuzz delegates to `root.fuzz`. We never run
-/// `zig build test --fuzz`, so this only implements corpus replay, matching
-/// Zig's own runner when `builtin.fuzz` is false.
+/// Replays fuzz corpora; active fuzzing is unsupported by this runner.
 pub fn fuzz(
     context: anytype,
     comptime testOne: fn (context: @TypeOf(context), smith: *testing.Smith) anyerror!void,

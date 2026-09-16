@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
-    // Compile the suite once, run disjoint modulo slices in concurrent processes.
+    // Compile once and run disjoint modulo slices concurrently.
     const test_step = b.step("test", "Run tests");
     const max_test_shards: u32 = 40;
     const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 1);
@@ -98,9 +98,7 @@ pub fn build(b: *std.Build) void {
 
     for (0..test_shard_count) |test_shard| {
         const run_shard_tests = b.addRunArtifact(suite_tests);
-        // Without this, Step.Run defaults to `.infer_from_args`, which is
-        // treated as side-effecting and runs under a global lock, serializing
-        // every shard instead of running them concurrently.
+        // Avoid Step.Run's side-effect lock so shards execute concurrently.
         run_shard_tests.expectExitCode(0);
         run_shard_tests.step.dependOn(&install_exe.step);
         run_shard_tests.setEnvironmentVariable(
