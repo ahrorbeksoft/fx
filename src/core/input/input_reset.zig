@@ -41,6 +41,7 @@ pub const State = struct {
         self.picker.model_completion_window_start = 0;
         self.picker.resetFilePickerIndex();
         self.picker.clearModelPickerFlow();
+        self.picker.clearProviderPickerFlow();
         self.composer_history.resetNavigation(alloc);
         self.edit_history.reset(alloc);
     }
@@ -64,6 +65,13 @@ pub const State = struct {
             debug_trace.logf(
                 "input",
                 "event=esc_clear_disarmed reason=pending_gesture_reset",
+                .{},
+            );
+        }
+        if (gesture_reset.cleared_escape_interrupt) {
+            debug_trace.logf(
+                "input",
+                "event=esc_interrupt_disarmed reason=pending_gesture_reset",
                 .{},
             );
         }

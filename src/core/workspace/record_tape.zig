@@ -23,15 +23,76 @@ const State = struct {
     enabled: bool = false,
     failed: bool = false,
     record_stdin: bool = false,
+    show_inline_notice: bool = false,
     file: ?std.Io.File = null,
     path: ?[]u8 = null,
     path_alloc: ?Allocator = null,
-    start_ms: i64 = 0,
     last_ms: i64 = 0,
 };
 
 var state_mutex: std.Io.Mutex = .init;
 var state: State = .{};
+
+const StartupDestination = union(enum) {
+    inactive,
+    automatic,
+    explicit: []const u8,
+};
+
+const StartupPolicyInput = struct {
+    debug_record: ?[]const u8 = null,
+    configured_path: ?[]const u8 = null,
+    record_input: ?[]const u8 = null,
+    silent_banner: ?[]const u8 = null,
+};
+
+const StartupPolicy = struct {
+    destination: StartupDestination,
+    record_stdin: bool,
+    strict_start: bool,
+    show_inline_notice: bool,
+};
+
+fn debug_env_truthy(raw: ?[]const u8) bool {
+    const value = raw orelse return false;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "yes") or
+        std.ascii.eqlIgnoreCase(trimmed, "on");
+}
+
+fn record_input_enabled(raw: ?[]const u8) bool {
+    const value = raw orelse return false;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "on");
+}
+
+fn resolve_startup_policy(input: StartupPolicyInput) StartupPolicy {
+    const configured_path = if (input.configured_path) |path|
+        std.mem.trim(u8, path, " \t\r\n")
+    else
+        "";
+    const debug_record = debug_env_truthy(input.debug_record);
+    const destination: StartupDestination = if (configured_path.len > 0)
+        .{ .explicit = configured_path }
+    else if (debug_record)
+        .automatic
+    else
+        .inactive;
+    const active = switch (destination) {
+        .inactive => false,
+        .automatic, .explicit => true,
+    };
+    return .{
+        .destination = destination,
+        .record_stdin = active and record_input_enabled(input.record_input),
+        .strict_start = debug_record,
+        .show_inline_notice = active and !debug_env_truthy(input.silent_banner),
+    };
+}
 
 fn nowMs() i64 {
     return io_mod.milliTimestamp();
@@ -39,12 +100,15 @@ fn nowMs() i64 {
 
 pub const CaptureStatus = union(enum) {
     inactive,
-    active: []u8,
+    active: struct {
+        path: []u8,
+        show_inline_notice: bool,
+    },
     failed,
 
     pub fn deinit(self: *CaptureStatus, alloc: Allocator) void {
         switch (self.*) {
-            .active => |path| alloc.free(path),
+            .active => |active| alloc.free(active.path),
             .inactive, .failed => {},
         }
         self.* = undefined;
@@ -53,40 +117,45 @@ pub const CaptureStatus = union(enum) {
 
 pub fn configureFromEnv(
     alloc: Allocator,
-    workspace_root: []const u8,
     initial_cols: u16,
     initial_rows: u16,
     fx_version: []const u8,
-    record_requested: bool,
 ) !void {
-    _ = workspace_root;
-
-    const configured_path = if (io_mod.getenv("FX_RECORD")) |raw_path|
-        std.mem.trim(u8, raw_path, " \t\r\n")
-    else
-        "";
-    if (configured_path.len > 0) {
-        configure(alloc, configured_path, initial_cols, initial_rows, fx_version) catch |err| {
-            if (record_requested) return err;
+    const policy = resolve_startup_policy(.{
+        .debug_record = io_mod.getenv("FX_DEBUG_RECORD"),
+        .configured_path = io_mod.getenv("FX_RECORD"),
+        .record_input = io_mod.getenv("FX_RECORD_INPUT"),
+        .silent_banner = io_mod.getenv("FX_DEBUG_RECORD_SILENT_BANNER"),
+    });
+    switch (policy.destination) {
+        .inactive => return,
+        .automatic => try configureAutomatic(
+            alloc,
+            initial_cols,
+            initial_rows,
+            fx_version,
+            policy.show_inline_notice,
+        ),
+        .explicit => |path| configureWithOptions(
+            alloc,
+            path,
+            initial_cols,
+            initial_rows,
+            fx_version,
+            false,
+            false,
+            policy.show_inline_notice,
+        ) catch |err| {
+            if (policy.strict_start) return err;
             return;
-        };
-    } else if (record_requested) {
-        try configureAutomatic(alloc, initial_cols, initial_rows, fx_version);
-    } else {
-        return;
+        },
     }
 
-    if (io_mod.getenv("FX_RECORD_INPUT")) |raw_value| {
-        const value = std.mem.trim(u8, raw_value, " \t\r\n");
-        if (std.ascii.eqlIgnoreCase(value, "1") or
-            std.ascii.eqlIgnoreCase(value, "true") or
-            std.ascii.eqlIgnoreCase(value, "on"))
-        {
-            const zio = io_mod.getIo();
-            state_mutex.lockUncancelable(zio);
-            defer state_mutex.unlock(zio);
-            state.record_stdin = true;
-        }
+    if (policy.record_stdin) {
+        const zio = io_mod.getIo();
+        state_mutex.lockUncancelable(zio);
+        defer state_mutex.unlock(zio);
+        state.record_stdin = true;
     }
 }
 
@@ -97,7 +166,7 @@ pub fn configure(
     initial_rows: u16,
     fx_version: []const u8,
 ) !void {
-    try configureWithOptions(alloc, path, initial_cols, initial_rows, fx_version, false, false);
+    try configureWithOptions(alloc, path, initial_cols, initial_rows, fx_version, false, false, true);
 }
 
 fn configureAutomatic(
@@ -105,6 +174,7 @@ fn configureAutomatic(
     initial_cols: u16,
     initial_rows: u16,
     fx_version: []const u8,
+    show_inline_notice: bool,
 ) !void {
     const home = if (io_mod.getenv("HOME")) |value| blk: {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -125,7 +195,7 @@ fn configureAutomatic(
         const path = try std.fmt.allocPrint(alloc, "{s}/fx-record-{d}-{s}.fxtape", .{ root, nowMs(), random_hex });
         defer alloc.free(path);
 
-        configureWithOptions(alloc, path, initial_cols, initial_rows, fx_version, true, true) catch |err| switch (err) {
+        configureWithOptions(alloc, path, initial_cols, initial_rows, fx_version, true, true, show_inline_notice) catch |err| switch (err) {
             error.PathAlreadyExists => continue,
             else => return err,
         };
@@ -142,6 +212,7 @@ fn configureWithOptions(
     fx_version: []const u8,
     exclusive: bool,
     private: bool,
+    show_inline_notice: bool,
 ) !void {
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);
@@ -166,10 +237,10 @@ fn configureWithOptions(
     const now = nowMs();
     state = .{
         .enabled = true,
+        .show_inline_notice = show_inline_notice,
         .file = file,
         .path = owned_path,
         .path_alloc = alloc,
-        .start_ms = now,
         .last_ms = now,
     };
 }
@@ -300,7 +371,10 @@ pub fn captureStatus(alloc: Allocator) !CaptureStatus {
     defer state_mutex.unlock(zio);
 
     if (state.enabled and state.path != null) {
-        return .{ .active = try alloc.dupe(u8, state.path.?) };
+        return .{ .active = .{
+            .path = try alloc.dupe(u8, state.path.?),
+            .show_inline_notice = state.show_inline_notice,
+        } };
     }
     return if (state.failed) .failed else .inactive;
 }
@@ -643,7 +717,7 @@ test "recordStdin suppresses input by default" {
     try expectNoFrame(bytes);
 }
 
-test "requested recording creates a private tape under home" {
+test "debug recording request creates a private tape under home" {
     const alloc = testing.allocator;
     resetEnvForTest();
     defer resetEnvForTest();
@@ -657,20 +731,21 @@ test "requested recording creates a private tape under home" {
     var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
     try env.put("HOME", home);
+    try env.put("FX_DEBUG_RECORD", "1");
 
     shutdown();
     defer shutdown();
     io_mod.setEnvironMap(&env);
-    try configureFromEnv(alloc, "/ignored/workspace", 80, 24, "vtest", true);
+    try configureFromEnv(alloc, 80, 24, "vtest");
 
     var status = try captureStatus(alloc);
     defer status.deinit(alloc);
     switch (status) {
-        .active => |path| {
+        .active => |active| {
             const expected_dir = try profile_paths.recordingsDir(alloc, home);
             defer alloc.free(expected_dir);
-            try testing.expect(std.mem.startsWith(u8, path, expected_dir));
-            const file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+            try testing.expect(std.mem.startsWith(u8, active.path, expected_dir));
+            const file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), active.path, .{});
             defer file.close(io_mod.getIo());
             if (@import("builtin").os.tag != .windows) {
                 const stat = try file.stat(io_mod.getIo());
@@ -681,7 +756,79 @@ test "requested recording creates a private tape under home" {
     }
 }
 
-test "requested recording uses the temporary fallback when HOME is empty" {
+test "startup policy resolves recording environment without effects" {
+    const ExpectedDestination = enum { inactive, automatic, explicit };
+    const cases = [_]struct {
+        input: StartupPolicyInput,
+        destination: ExpectedDestination,
+        explicit_path: ?[]const u8 = null,
+        record_stdin: bool = false,
+        strict_start: bool = false,
+        show_inline_notice: bool = false,
+    }{
+        .{
+            .input = .{},
+            .destination = .inactive,
+        },
+        .{
+            .input = .{ .debug_record = "1" },
+            .destination = .automatic,
+            .strict_start = true,
+            .show_inline_notice = true,
+        },
+        .{
+            .input = .{ .debug_record = "0", .record_input = "1" },
+            .destination = .inactive,
+        },
+        .{
+            .input = .{
+                .configured_path = " /tmp/recording.fxtape ",
+                .record_input = "true",
+                .silent_banner = "yes",
+            },
+            .destination = .explicit,
+            .explicit_path = "/tmp/recording.fxtape",
+            .record_stdin = true,
+        },
+        .{
+            .input = .{
+                .debug_record = "ON",
+                .configured_path = "/tmp/explicit.fxtape",
+                .silent_banner = "false",
+            },
+            .destination = .explicit,
+            .explicit_path = "/tmp/explicit.fxtape",
+            .strict_start = true,
+            .show_inline_notice = true,
+        },
+        .{
+            .input = .{
+                .configured_path = "/tmp/input-yes.fxtape",
+                .record_input = "yes",
+            },
+            .destination = .explicit,
+            .explicit_path = "/tmp/input-yes.fxtape",
+            .show_inline_notice = true,
+        },
+    };
+
+    for (cases) |case| {
+        const policy = resolve_startup_policy(case.input);
+        try testing.expectEqual(case.record_stdin, policy.record_stdin);
+        try testing.expectEqual(case.strict_start, policy.strict_start);
+        try testing.expectEqual(case.show_inline_notice, policy.show_inline_notice);
+        switch (policy.destination) {
+            .inactive => try testing.expectEqual(ExpectedDestination.inactive, case.destination),
+            .automatic => try testing.expectEqual(ExpectedDestination.automatic, case.destination),
+            .explicit => |path| {
+                try testing.expectEqual(ExpectedDestination.explicit, case.destination);
+                try testing.expectEqualStrings(case.explicit_path.?, path);
+            },
+        }
+    }
+}
+
+test "debug recording request uses the temporary fallback when HOME is empty" {
     const alloc = testing.allocator;
     resetEnvForTest();
     defer resetEnvForTest();
@@ -689,22 +836,23 @@ test "requested recording uses the temporary fallback when HOME is empty" {
     var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
     try env.put("HOME", "");
+    try env.put("FX_DEBUG_RECORD", "1");
 
     shutdown();
     defer shutdown();
     io_mod.setEnvironMap(&env);
-    try configureFromEnv(alloc, "/ignored/workspace", 80, 24, "vtest", true);
+    try configureFromEnv(alloc, 80, 24, "vtest");
 
     var status = try captureStatus(alloc);
     defer status.deinit(alloc);
     switch (status) {
-        .active => |path| {
-            try testing.expect(std.mem.startsWith(u8, path, "/tmp/fx-recordings/"));
+        .active => |active| {
+            try testing.expect(std.mem.startsWith(u8, active.path, "/tmp/fx-recordings/"));
             shutdown();
-            if (std.fs.path.isAbsolute(path)) {
-                std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
+            if (std.fs.path.isAbsolute(active.path)) {
+                std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), active.path) catch {};
             } else {
-                std.Io.Dir.cwd().deleteFile(io_mod.getIo(), path) catch {};
+                std.Io.Dir.cwd().deleteFile(io_mod.getIo(), active.path) catch {};
             }
         },
         else => return error.TestExpectedActiveRecording,
@@ -734,7 +882,7 @@ test "configureFromEnv enables stdin for the accepted truthy values only" {
         shutdown();
         io_mod.setEnvironMap(&env);
         defer resetEnvForTest();
-        try configureFromEnv(alloc, "/ignored/workspace", 80, 24, "v", false);
+        try configureFromEnv(alloc, 80, 24, "v");
         recordStdin("typed");
         shutdown();
 
@@ -758,7 +906,7 @@ test "configureFromEnv enables stdin for the accepted truthy values only" {
 
     shutdown();
     io_mod.setEnvironMap(&env);
-    try configureFromEnv(alloc, "/ignored/workspace", 80, 24, "v", false);
+    try configureFromEnv(alloc, 80, 24, "v");
     recordStdin("typed");
     shutdown();
 

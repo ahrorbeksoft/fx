@@ -1,37 +1,24 @@
 const std = @import("std");
+const shared_theme = @import("../../core/shared/theme.zig");
 const languages = @import("code_highlight_languages.zig");
 
 const Allocator = std.mem.Allocator;
-
-const reset_style = "\x1b[39m";
 
 pub const Theme = enum {
     dark,
     light,
 };
 
-const Palette = struct {
-    keyword_style: []const u8,
-    string_style: []const u8,
-    number_style: []const u8,
-    comment_style: []const u8,
-};
+const Palette = shared_theme.SyntaxPalette;
 
-const dark_palette: Palette = .{
-    .keyword_style = "\x1b[38;5;252m",
-    .string_style = "\x1b[38;5;250m",
-    .number_style = "\x1b[38;5;250m",
-    .comment_style = "\x1b[38;5;245m",
-};
-
-const light_palette: Palette = .{
-    .keyword_style = "\x1b[38;5;238m",
-    .string_style = "\x1b[38;5;241m",
-    .number_style = "\x1b[38;5;241m",
-    .comment_style = "\x1b[38;5;243m",
-};
+const dark_palette: Palette = shared_theme.fx_dark.syntax;
+const light_palette: Palette = shared_theme.fx_light.syntax;
 
 fn paletteForTheme(theme: Theme) Palette {
+    const active = shared_theme.current();
+    // When the requested variant matches the active theme, custom themes
+    // contribute their syntax palette; otherwise render the builtin variant.
+    if (active.light == (theme == .light)) return active.syntax;
     return switch (theme) {
         .dark => dark_palette,
         .light => light_palette,
@@ -100,7 +87,9 @@ pub fn highlight(
 fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, text: []const u8) !void {
     try out.appendSlice(alloc, style);
     try out.appendSlice(alloc, text);
-    try out.appendSlice(alloc, reset_style);
+    // Close whatever the slot opened: fg-only slots keep the plain reset,
+    // themed slots carrying bold/italic get those reset too.
+    try out.appendSlice(alloc, shared_theme.closingFor(style));
 }
 
 fn blockCommentEnd(source: []const u8, index: usize, block_comment: ?languages.BlockComment) ?usize {
@@ -300,4 +289,24 @@ test "profiles use configured block comments and case-insensitive keywords" {
     try std.testing.expect(std.mem.indexOf(u8, css, "\x1b[38;5;245m/* comment */\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\x1b[38;5;252mSELECT\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "\x1b[38;5;245m<!-- note -->\x1b[39m") != null);
+}
+
+test "themed attribute slots close fully without bleeding into later text" {
+    const alloc = std.testing.allocator;
+    const previous = shared_theme.current();
+    defer shared_theme.activate(previous);
+
+    var custom = shared_theme.fx_dark;
+    custom.syntax.comment_style = "\x1b[3;38;2;106;153;85m";
+    custom.syntax.keyword_style = "\x1b[1;38;2;130;210;206m";
+    shared_theme.activate(custom);
+
+    const styled = try highlight(alloc, "const x = 1; // note\n", languages.resolve("zig").?, .dark);
+    defer alloc.free(styled);
+
+    // Italic comment and bold keyword each close with their attributes reset.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[3;38;2;106;153;85m// note\x1b[39m\x1b[23m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[1;38;2;130;210;206mconst\x1b[39m\x1b[22m") != null);
+    // Nothing stays bold or italic past the final close.
+    try std.testing.expect(!std.mem.endsWith(u8, styled, "\x1b[3;38;2;106;153;85m"));
 }

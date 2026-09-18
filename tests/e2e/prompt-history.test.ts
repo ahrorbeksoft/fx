@@ -46,12 +46,18 @@ function currentComposerLine(pane: string): string {
   return pane.split("\n").filter(isComposerLine).at(-1) ?? "";
 }
 
+function slashMenuRows(pane: string): string[] {
+  return pane.split("\n").filter((line) =>
+    !isComposerLine(line) && line.trimStart().startsWith("/")
+  );
+}
+
 async function disablePromptHistory(
   session: TmuxSession,
   settingsPath: string,
 ): Promise<void> {
   await session.sendText("/settings");
-  await session.waitForText("←→ Change", TIMEOUT);
+  await session.waitForText("←→ change", TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
     (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
@@ -70,7 +76,7 @@ async function disablePromptHistory(
   if (enabled !== false) throw new Error("Timed out disabling prompt history");
   await session.sendKeys("Escape");
   await session.waitForPane(
-    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ Change"),
+    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
     TIMEOUT,
   );
 }
@@ -111,9 +117,9 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.sendText("PLAN10_PROMPT_HISTORY_SENTINEL");
         await session.waitForText("HTTP 401", TIMEOUT);
         await session.sendText("/help");
-        await session.waitForText("Commands 36", TIMEOUT);
+        await session.waitForText("Commands 34", TIMEOUT);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("Enter Open"), TIMEOUT);
+        await session.waitForPane((pane) => !pane.includes("enter open"), TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -129,26 +135,55 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
           env: rejectedGatewayEnv(home, gateway),
         });
         await session.waitForText("Run /help", TIMEOUT);
+
+        await session.sendLiteral("/");
+        await session.waitForPane((current) => slashMenuRows(current).length > 0, TIMEOUT);
+        await session.sendKeys("C-u");
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+
         await session.sendKeys("Up");
         let pane = await session.waitForPane(
           (current) => currentComposerLine(current).includes("/quit"),
           TIMEOUT,
         );
         expect(currentComposerLine(pane)).toContain("/quit");
+        expect(slashMenuRows(pane)).toEqual([]);
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         pane = await session.waitForPane(
           (current) => currentComposerLine(current).includes("/help"),
           TIMEOUT,
         );
         expect(currentComposerLine(pane)).toContain("/help");
+        expect(slashMenuRows(pane)).toEqual([]);
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         pane = await session.waitForPane(
           (current) => currentComposerLine(current).includes("PLAN10_PROMPT_HISTORY_SENTINEL"),
           TIMEOUT,
         );
         expect(currentComposerLine(pane)).toContain("PLAN10_PROMPT_HISTORY_SENTINEL");
+
+        await session.sendKeys("Down");
+        pane = await session.waitForPane(
+          (current) => currentComposerLine(current).includes("/help"),
+          TIMEOUT,
+        );
+        expect(slashMenuRows(pane)).toEqual([]);
+
+        await session.sendKeys("BSpace");
+        pane = await session.waitForPane(
+          (current) =>
+            currentComposerLine(current).includes("/hel") &&
+            slashMenuRows(current).length > 0,
+          TIMEOUT,
+        );
+        expect(currentComposerLine(pane)).toContain("/hel");
+        await session.sendKeys("C-u");
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        expect(session.isAlive()).toBe(true);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -253,7 +288,8 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
         expect(composer).toContain("/settings");
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         recalled = await session.waitForPane(
           (pane) => {
             const current = currentComposerLine(pane);
@@ -268,7 +304,8 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
         expect(composer).toContain("/quit");
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         recalled = await session.waitForPane(
           (pane) => {
             const current = currentComposerLine(pane);

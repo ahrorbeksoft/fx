@@ -93,8 +93,8 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(50.0, percentile(samples, 0.50))
         self.assertEqual(95.0, percentile(samples, 0.95))
 
-    def test_production_plans_cover_six_startup_and_six_heavy_workloads(self) -> None:
-        self.assertEqual(6, len(STARTUP_COMMANDS))
+    def test_production_plans_cover_five_startup_and_six_heavy_workloads(self) -> None:
+        self.assertEqual(5, len(STARTUP_COMMANDS))
         workload_names = tuple(
             workload.name
             for plan in BENCHMARK_PLANS
@@ -308,7 +308,7 @@ class PgsoQualificationTests(unittest.TestCase):
         hyperfine_calls = [
             command for command in calls if command[0] == str(hyperfine)
         ]
-        self.assertEqual(600, len(hyperfine_calls))
+        self.assertEqual(500, len(hyperfine_calls))
         for command_start in range(0, len(hyperfine_calls), 100):
             command_rounds = hyperfine_calls[command_start : command_start + 100]
             for round_index, command in enumerate(command_rounds):
@@ -552,6 +552,122 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(str(candidate), calls[1][0])
         self.assertTrue(results[0].passed)
 
+    def test_ui_activity_measurement_uses_alternating_hyperfine_rounds(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="ui_activity",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            if command[0] != str(hyperfine):
+                return CommandResult(command, 0, "measured\n", "", 1.0)
+            export_path = pathlib.Path(
+                command[command.index("--export-json") + 1]
+            )
+            labels = [
+                command[index + 1]
+                for index, value in enumerate(command)
+                if value == "--command-name"
+            ]
+            export_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "command": label,
+                                "times": [1.0 if label == "control" else 0.9],
+                            }
+                            for label in labels
+                        ]
+                    }
+                )
+            )
+            return CommandResult(command, 0, "", "", 1.0)
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_benchmark_pair",
+                side_effect=AssertionError("must use immutable prebuilt pair"),
+            ),
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+        ):
+            results = measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("ui-activity",),
+                prebuilt_pairs={"ui_activity": pair},
+                hyperfine_binary=hyperfine,
+            )
+
+        hyperfine_calls = [
+            command for command in calls if command[0] == str(hyperfine)
+        ]
+        self.assertEqual(50, len(hyperfine_calls))
+        for round_index, command in enumerate(hyperfine_calls):
+            self.assertEqual("1", command[command.index("--runs") + 1])
+            self.assertEqual(
+                "0",
+                command[command.index("--warmup") + 1],
+            )
+            self.assertEqual(
+                (
+                    ("control", "candidate")
+                    if round_index % 2 == 0
+                    else ("candidate", "control")
+                ),
+                tuple(
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--command-name"
+                ),
+            )
+        self.assertEqual(50, len(results[0].control_samples))
+        self.assertEqual(50, len(results[0].candidate_samples))
+        self.assertTrue(results[0].passed)
+
+    def test_ui_activity_measurement_requires_hyperfine(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        for path in (control, candidate):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="ui_activity",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "microbenchmark measurement requires Hyperfine: ui_activity",
+        ):
+            measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("ui-activity",),
+                prebuilt_pairs={"ui_activity": pair},
+            )
+
     def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
         plan = BENCHMARK_PLANS[0]
         output = self.root / "pair"
@@ -595,6 +711,7 @@ class PgsoQualificationTests(unittest.TestCase):
         paths = PipelinePaths.create(self.root / "run")
         paths.merged_profile.write_bytes(b"production profile")
         built_selectors: list[str] = []
+        supplement_events: list[str] = []
 
         def fake_build(_toolchain, _repo_root, output_dir, plan):
             built_selectors.append(plan.selector)
@@ -616,12 +733,18 @@ class PgsoQualificationTests(unittest.TestCase):
             )
 
         def fake_create(_toolchain, **kwargs):
+            supplement_events.append(f"create:{kwargs['output_text'].stem}")
             output_text = kwargs["output_text"]
             output_text.write_text("supplement\n")
             return ProfileSupplement(
                 text="supplement\n",
                 function_names=("fx;core.output.diff.compute",),
                 total_counter_value=8,
+            )
+
+        def fake_merge(_toolchain, **kwargs):
+            supplement_events.append(
+                f"merge:{kwargs['supplement_text'].stem}"
             )
 
         with (
@@ -634,7 +757,8 @@ class PgsoQualificationTests(unittest.TestCase):
                 side_effect=fake_create,
             ),
             mock.patch(
-                "scripts.pgso.qualify.merge_profile_supplement"
+                "scripts.pgso.qualify.merge_profile_supplement",
+                side_effect=fake_merge,
             ) as merge,
         ):
             linked = build_profile_linked_benchmarks(
@@ -652,6 +776,13 @@ class PgsoQualificationTests(unittest.TestCase):
             tuple(built_selectors),
         )
         self.assertEqual(len(BENCHMARK_PLANS), merge.call_count)
+        self.assertEqual(
+            [
+                *(f"create:{plan.selector}" for plan in BENCHMARK_PLANS),
+                *(f"merge:{plan.selector}" for plan in BENCHMARK_PLANS),
+            ],
+            supplement_events,
+        )
 
         def fake_map(_toolchain, **kwargs):
             kwargs["output_text"].write_text("mapped text\n")

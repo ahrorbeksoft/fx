@@ -14,12 +14,11 @@ pub const approval_panel_rows_compact: u16 = 8;
 pub const approval_panel_rows_spacious: u16 = 11;
 pub const approval_spacious_min_terminal_rows: u16 = 34;
 pub const approval_once_label = "1. Yes";
-pub const approval_always_file_label = "2. Yes, and don't ask again for this request";
 pub const approval_deny_label = "3. No";
-pub const approval_hint = "1–3 Choose now    ↑↓ or Tab Options    Enter Confirm    Esc Cancel";
-pub const approval_amendment_hint = "1–3 Choose now    ↑↓ Options    Tab Amend    Enter Confirm    Esc Cancel";
-pub const approval_hint_compact = "1–3 Choose now    Enter Confirm    Esc Cancel";
-pub const approval_hint_minimal = "Enter Confirm    Esc Cancel";
+pub const approval_hint = "1–3 choose now    ↑↓ or tab options    enter confirm    esc cancel";
+pub const approval_amendment_hint = "1–3 choose now    ↑↓ options    tab amend    enter confirm    esc cancel";
+pub const approval_hint_compact = "1–3 choose now    enter confirm    esc cancel";
+pub const approval_hint_minimal = "enter confirm    esc cancel";
 // Ordered widest-first; every variant keeps the enter/esc controls so narrow
 // terminals never lose the submit and cancel instructions.
 pub const approval_hint_variants = [_][]const u8{ approval_hint, approval_hint_compact, approval_hint_minimal };
@@ -104,7 +103,7 @@ test "command approval retains its committed screen state across review sync" {
     var screen = ApprovalScreenState{};
     const request: permission_request.PermissionRequest = .{
         .id = 21,
-        .label = "terminal.exec printf '%s' command-review",
+        .label = "shell.run printf '%s' command-review",
     };
     try std.testing.expect(try prompt.syncRequest(alloc, request));
     screen.scrollDocument(6);
@@ -129,7 +128,7 @@ test "approval prompt enters amendment with tab and submits selected decision" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
 
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec npm run dev" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run npm run dev" }));
     try std.testing.expect(prompt.isActive());
     try std.testing.expect(prompt.can_amend_selected_choice());
 
@@ -164,7 +163,7 @@ test "approval amendment bounded typing rejects without changing its draft" {
     defer prompt.deinit(std.testing.allocator);
 
     try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
     _ = try applyApprovalByteForTest(&prompt, std.testing.allocator, '\t', null);
     try std.testing.expectEqual(
@@ -188,7 +187,7 @@ test "approval prompt preserves amendment drafts while moving choices" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
 
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run npm test" }));
     _ = try applyApprovalByteForTest(&prompt, std.testing.allocator, '\t', null);
     _ = try applyApprovalByteForTest(&prompt, std.testing.allocator, 'y', null);
     _ = try applyApprovalByteForTest(&prompt, std.testing.allocator, 'e', null);
@@ -232,7 +231,7 @@ test "non-amendable approval keeps tab choice navigation" {
     defer prompt.deinit(std.testing.allocator);
 
     try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{
-        .label = "terminal.exec sleep 30",
+        .label = "shell.run sleep 30",
         .amendment_allowed = false,
     }));
     for ([_]u8{ 1, 2, 0 }) |expected_choice| {
@@ -254,7 +253,7 @@ test "approval prompt digits submit their mapped decisions" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
 
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec curl -I https://example.com" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run curl -I https://example.com" }));
 
     const cases = [_]struct {
         byte: u8,
@@ -281,7 +280,7 @@ test "approval prompt ignores inert printable bytes without changing choice" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
 
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec curl -I https://example.com" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run curl -I https://example.com" }));
     prompt.decision.choice_index = 1;
 
     for ("typing a reply 0456789 YP hjkl") |byte| {
@@ -297,7 +296,7 @@ test "approval prompt ignores printable shortcut bytes" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
 
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec curl -I https://example.com" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run curl -I https://example.com" }));
 
     for ("0456789yYpPhjkl") |byte| {
         try std.testing.expectEqual(

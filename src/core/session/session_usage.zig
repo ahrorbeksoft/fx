@@ -113,6 +113,7 @@ pub const InvocationObservation = struct {
         usage_outcome: stream_provider.UsageOutcome,
     ) !void {
         const ledger = self.usage orelse return;
+        ledger.observeContextUsage(self.sequence, completion.usage);
         switch (usage_outcome) {
             .unavailable => |availability| {
                 const delivery: DeliveryOutcome = switch (availability) {
@@ -213,7 +214,7 @@ pub const InvocationObservation = struct {
                     "usage generation queued sequence={d} id={s}",
                     .{ self.sequence, reference.generation_id },
                 );
-                ledger.flushProfilePublications();
+                ledger.scheduleProfilePublicationDrain();
             },
             .unavailable => unreachable,
         }
@@ -373,6 +374,8 @@ pub const Usage = struct {
     reasoning_tokens: ?u64,
     request_count: ?u64,
     billable_web_search_calls: u64 = 0,
+    latest_context_sequence: u64 = 0,
+    latest_context_used: ?u64 = null,
     lines_added: u64 = 0,
     lines_removed: u64 = 0,
     models: std.ArrayList(ModelAggregate) = .empty,
@@ -390,6 +393,11 @@ pub const Usage = struct {
     reconciliation_authority: ?ReconciliationAuthority = null,
     reconciliation_credential_blocked: bool = false,
     generation_usage_providers: generation_usage.Set = .{},
+    publication_drain_mutex: std.Io.Mutex = .init,
+    publication_drain_thread: ?std.Thread = null,
+    publication_drain_done: std.atomic.Value(bool) = .init(true),
+    publication_drain_cancel: std.atomic.Value(bool) = .init(false),
+    publication_drain_epoch: std.atomic.Value(u64) = .init(0),
 
     pub fn initFresh() Usage {
         return .{
@@ -427,17 +435,20 @@ pub const Usage = struct {
 
     pub fn deinit(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.clearOwned(alloc);
         self.* = undefined;
     }
 
     pub fn resetFresh(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.reset(alloc, true);
     }
 
     pub fn resetLegacy(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.reset(alloc, false);
     }
 
@@ -523,10 +534,11 @@ pub const Usage = struct {
         outcome: DeliveryOutcome,
     ) !void {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         self.finishInvocation(sequence, duration_ms, outcome);
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        self.flushProfilePublications();
+        self.scheduleProfilePublicationDrain();
     }
 
     fn finishObservedInvocationDurably(
@@ -540,6 +552,7 @@ pub const Usage = struct {
         team: ?[]const u8,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const accepted = self.finishObservedInvocationAccepted(
             alloc,
             sequence,
@@ -550,17 +563,17 @@ pub const Usage = struct {
             team,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.scheduleProfilePublicationDrain();
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -574,6 +587,7 @@ pub const Usage = struct {
         reference: stream_provider.DeferredUsageReference,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const accepted = self.finishDeferredInvocationAccepted(
             alloc,
             sequence,
@@ -582,17 +596,17 @@ pub const Usage = struct {
             reference,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.scheduleProfilePublicationDrain();
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -658,6 +672,7 @@ pub const Usage = struct {
         };
 
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const durable_bridge = self.checkpoint_sink != null;
         const accepted = self.finishExactInvocationAccepted(
             alloc,
@@ -670,7 +685,7 @@ pub const Usage = struct {
             durable_bridge,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             self.checkpoint_mutex.unlock(io_mod.getIo());
             debug_trace.logf(
                 "session",
@@ -680,16 +695,16 @@ pub const Usage = struct {
             return false;
         };
         if (!accepted) {
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
-        if (durable_bridge and !self.persistCheckpointBestEffortLocked()) {
+        if (durable_bridge and !(try self.persistCheckpointForContinuationLocked())) {
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        if (durable_bridge) self.flushProfilePublications();
+        if (durable_bridge) self.scheduleProfilePublicationDrain();
         return true;
     }
 
@@ -738,6 +753,10 @@ pub const Usage = struct {
     }
 
     fn persistCheckpointBestEffortLocked(self: *Usage) bool {
+        return self.persistCheckpointForContinuationLocked() catch false;
+    }
+
+    fn persistCheckpointForContinuationLocked(self: *Usage) error{ SessionPersistenceUncertain, SessionWriterChanged, SessionWriterParked, SessionCommitFailed }!bool {
         const sink = self.checkpoint_sink orelse return true;
         var persisted = self.snapshotCurrent(sink.allocator) catch |err| {
             self.markBillingIncomplete();
@@ -756,6 +775,14 @@ pub const Usage = struct {
                 "usage checkpoint unavailable; billing marked incomplete reason={s}",
                 .{@errorName(err)},
             );
+            switch (err) {
+                error.SessionPersistenceUncertain,
+                error.SessionWriterChanged,
+                error.SessionWriterParked,
+                error.SessionCommitFailed,
+                => return @errorCast(err),
+                else => {},
+            }
             return false;
         };
         self.markClean(persisted);
@@ -955,7 +982,7 @@ pub const Usage = struct {
             }
             if (std.mem.eql(u8, pending.id, id)) {
                 if (pending.sequence != sequence or
-                    pending.provider != provider or
+                    !pending.provider.same_authority(provider) or
                     !std.mem.eql(u8, pending.origin, origin) or
                     !optionalStringsEqual(pending.team, team) or
                     pending.credential_source != credential_source or
@@ -1298,6 +1325,57 @@ pub const Usage = struct {
         };
     }
 
+    /// Queues a profile-publication drain so invocation finish paths never run
+    /// the append-only store's full-file parse on the agent worker thread. The
+    /// session checkpoint is already durable before this is called; the drain
+    /// only updates the profile-level usage ledger. Tests keep the legacy
+    /// synchronous flush so assertions stay deterministic.
+    fn scheduleProfilePublicationDrain(self: *Usage) void {
+        if (builtin.is_test or comptime builtin.os.tag == .wasi) {
+            self.flushProfilePublications();
+            return;
+        }
+        _ = self.publication_drain_epoch.fetchAdd(1, .seq_cst);
+        self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
+        defer self.publication_drain_mutex.unlock(io_mod.getIo());
+        if (self.publication_drain_thread) |thread| {
+            if (!self.publication_drain_done.load(.seq_cst)) return;
+            thread.join();
+            self.publication_drain_thread = null;
+            self.publication_drain_done.store(true, .seq_cst);
+        }
+        self.publication_mutex.lockUncancelable(io_mod.getIo());
+        const has_sink = self.publication_sink != null;
+        self.publication_mutex.unlock(io_mod.getIo());
+        if (!has_sink) return;
+        self.publication_drain_cancel.store(false, .seq_cst);
+        self.publication_drain_done.store(false, .seq_cst);
+        self.publication_drain_thread = std.Thread.spawn(.{}, publicationDrainThreadMain, .{self}) catch |err| {
+            self.publication_drain_done.store(true, .seq_cst);
+            debug_trace.logf(
+                "session",
+                "usage profile publication drain start failed reason={s}",
+                .{@errorName(err)},
+            );
+            self.flushProfilePublications();
+            return;
+        };
+    }
+
+    /// Stops the background profile-publication drain, joining any live worker.
+    /// A later schedule starts a fresh worker.
+    fn stopPublicationDrain(self: *Usage) void {
+        if (builtin.is_test or comptime builtin.os.tag == .wasi) return;
+        self.publication_drain_cancel.store(true, .seq_cst);
+        self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
+        defer self.publication_drain_mutex.unlock(io_mod.getIo());
+        const thread = self.publication_drain_thread;
+        self.publication_drain_thread = null;
+        if (thread) |handle| handle.join();
+        self.publication_drain_done.store(true, .seq_cst);
+        self.publication_drain_cancel.store(false, .seq_cst);
+    }
+
     fn flushProfilePublications(self: *Usage) void {
         self.publication_mutex.lockUncancelable(io_mod.getIo());
         const sink = self.publication_sink orelse {
@@ -1480,6 +1558,41 @@ pub const Usage = struct {
         self.dirty = true;
     }
 
+    pub const LiveContextSnapshot = struct {
+        used: u64,
+        complete_cost: ?f64,
+    };
+
+    /// Returns the latest provider-reported context usage. This state is
+    /// intentionally runtime-only: a restored billing aggregate cannot prove
+    /// how much context the next model request currently occupies.
+    pub fn liveContextSnapshot(self: *Usage) ?LiveContextSnapshot {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return .{
+            .used = self.latest_context_used orelse return null,
+            .complete_cost = if (self.billing == .complete and std.math.isFinite(self.total_cost))
+                self.total_cost
+            else
+                null,
+        };
+    }
+
+    fn observeContextUsage(self: *Usage, sequence: u64, provider_usage: types.Usage) void {
+        const used: ?u64 = if (provider_usage.input_tokens) |input|
+            if (provider_usage.output_tokens) |output|
+                std.math.add(u64, input, output) catch null
+            else
+                null
+        else
+            null;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (sequence < self.latest_context_sequence) return;
+        self.latest_context_sequence = sequence;
+        self.latest_context_used = used;
+    }
+
     /// Returns an owned point-in-time snapshot. The caller must call `deinit`.
     pub fn snapshot(self: *Usage, alloc: Allocator) !Snapshot {
         self.finishReconciliationIfDone();
@@ -1636,6 +1749,7 @@ pub const Usage = struct {
         session_started_at_ms: i64,
     ) !void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         try validateSnapshot(source);
 
         var copied = try dupeSnapshotOwned(alloc, source);
@@ -1661,6 +1775,8 @@ pub const Usage = struct {
             self.active_started_at_ms = session_started_at_ms;
         }
         self.active_sequence_count = 0;
+        self.latest_context_sequence = 0;
+        self.latest_context_used = null;
         self.total_cost = copied.total_cost;
         self.input_tokens = copied.input_tokens;
         self.output_tokens = copied.output_tokens;
@@ -1717,6 +1833,23 @@ pub const Usage = struct {
         self.startReconciliationWithCredential(
             alloc,
             credential,
+            .{
+                .provider = reference.provider,
+                .credential_identity = reference.credential_identity,
+            },
+            false,
+            null,
+        );
+    }
+
+    pub fn startHostManagedDeferredReconciliation(
+        self: *Usage,
+        alloc: Allocator,
+        reference: stream_provider.DeferredUsageReference,
+    ) void {
+        self.startReconciliationWithCredential(
+            alloc,
+            null,
             .{
                 .provider = reference.provider,
                 .credential_identity = reference.credential_identity,
@@ -1783,6 +1916,23 @@ pub const Usage = struct {
         );
     }
 
+    pub fn replaceHostManagedReconciliationAuthority(
+        self: *Usage,
+        alloc: Allocator,
+        provider: model_provider.ProviderId,
+    ) void {
+        self.startReconciliationWithCredential(
+            alloc,
+            null,
+            .{
+                .provider = provider,
+                .credential_identity = credential_authority.derive(.host_managed, null),
+            },
+            true,
+            null,
+        );
+    }
+
     /// Replaces a producer's key only while that key is still authoritative.
     pub fn refreshReconciliationCredential(
         self: *Usage,
@@ -1819,13 +1969,16 @@ pub const Usage = struct {
     fn startReconciliationWithCredential(
         self: *Usage,
         alloc: Allocator,
-        api_key: []const u8,
+        credential: ?[]const u8,
         authority: ReconciliationAuthority,
         replace_existing: bool,
         expected_api_key: ?[]const u8,
     ) void {
-        if (api_key.len == 0) return;
-        const key_digest = reconciliationKeyDigest(api_key);
+        if (credential) |api_key| if (api_key.len == 0) return;
+        const key_digest = if (credential) |api_key|
+            reconciliationKeyDigest(api_key)
+        else
+            hostManagedReconciliationDigest();
         const expected_digest = if (expected_api_key) |expected|
             reconciliationKeyDigest(expected)
         else
@@ -1876,21 +2029,24 @@ pub const Usage = struct {
         self.mutex.unlock(io_mod.getIo());
         if (!still_has_pending) return;
 
-        const api_key_copy = alloc.dupe(u8, api_key) catch |err| {
-            debug_trace.logf(
-                "session",
-                "usage reconciliation start failed reason={s}",
-                .{@errorName(err)},
-            );
-            return;
-        };
+        const credential_copy = if (credential) |api_key|
+            alloc.dupe(u8, api_key) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "usage reconciliation start failed reason={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            }
+        else
+            null;
         self.reconciliation_cancel.store(false, .seq_cst);
         self.reconciliation_done.store(false, .seq_cst);
         self.reconciliation_key_digest = key_digest;
         self.reconciliation_thread = std.Thread.spawn(
             .{},
             reconciliationThreadMain,
-            .{ self, alloc, api_key_copy, authority, self.generation_usage_providers },
+            .{ self, alloc, credential_copy, authority, self.generation_usage_providers },
         ) catch |err| {
             self.reconciliation_done.store(true, .seq_cst);
             debug_trace.logf(
@@ -1898,7 +2054,7 @@ pub const Usage = struct {
                 "usage reconciliation start failed reason={s}",
                 .{@errorName(err)},
             );
-            secret.zeroAndFree(alloc, api_key_copy);
+            if (credential_copy) |api_key| secret.zeroAndFree(alloc, api_key);
             return;
         };
     }
@@ -1921,6 +2077,7 @@ pub const Usage = struct {
     }
 
     pub fn finishProfilePublicationsBeforeShutdown(self: *Usage) void {
+        self.stopPublicationDrain();
         self.flushProfilePublications();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -2072,7 +2229,7 @@ pub const Usage = struct {
                 generation.sequence != saved.sequence or
                 !std.mem.eql(u8, generation.origin, saved.origin) or
                 !optionalStringsEqual(generation.team, saved.team) or
-                generation.provider != saved.provider or
+                !generation.provider.same_authority(saved.provider) or
                 generation.credential_source != saved.credential_source or
                 !optionalCredentialIdentitiesEqual(generation.credential_identity, saved.credential_identity) or
                 !optionalStringsEqual(generation.account_id, saved.account_id) or
@@ -2121,6 +2278,8 @@ pub const Usage = struct {
         self.wall_duration_ms = 0;
         self.active_started_at_ms = io_mod.milliTimestamp();
         self.active_sequence_count = 0;
+        self.latest_context_sequence = 0;
+        self.latest_context_used = null;
         self.total_cost = 0;
         self.input_tokens = 0;
         self.output_tokens = 0;
@@ -2153,12 +2312,17 @@ const ReconciliationAuthority = struct {
     credential_identity: ?credential_authority.Identity,
 
     fn eql(self: ReconciliationAuthority, other: ReconciliationAuthority) bool {
-        return self.provider == other.provider and
+        return self.provider.same_authority(other.provider) and
             optionalCredentialIdentitiesEqual(self.credential_identity, other.credential_identity);
     }
 };
 
 pub fn validateSnapshot(snapshot: Snapshot) !void {
+    _ = try validateSnapshotContract(snapshot, false);
+}
+
+fn validateSnapshotContract(snapshot: Snapshot, allow_legacy_cache: bool) !bool {
+    var cache_totals_valid = true;
     if (snapshot.next_sequence == 0) return error.InvalidUsageSnapshot;
     if (snapshot.settled_through_sequence >= snapshot.next_sequence) {
         return error.InvalidUsageSnapshot;
@@ -2225,7 +2389,8 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         if (model.cache_read_tokens > model.input_tokens or
             model.cache_write_tokens > model.input_tokens)
         {
-            return error.InvalidUsageSnapshot;
+            if (!allow_legacy_cache) return error.InvalidUsageSnapshot;
+            cache_totals_valid = false;
         }
         if (model.reasoning_tokens) |reasoning| {
             if (reasoning > model.output_tokens) return error.InvalidUsageSnapshot;
@@ -2320,6 +2485,7 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         }
     }
     if (identifier_bytes > max_identifier_bytes) return error.UsageCapacityExceeded;
+    return cache_totals_valid;
 }
 
 pub fn appendIncidentOwned(
@@ -2453,7 +2619,7 @@ pub fn billingProjectionEql(first: Snapshot, second: Snapshot) bool {
             left.sequence != right.sequence or
             !std.mem.eql(u8, left.origin, right.origin) or
             !optionalStringsEqual(left.team, right.team) or
-            left.provider != right.provider or
+            !left.provider.same_authority(right.provider) or
             left.credential_source != right.credential_source or
             !optionalCredentialIdentitiesEqual(left.credential_identity, right.credential_identity) or
             !optionalStringsEqual(left.account_id, right.account_id))
@@ -2653,16 +2819,61 @@ fn writePendingAuthority(writer: *std.Io.Writer, pending: PendingGeneration) !vo
 
 /// Parses either the rollback-readable or current usage snapshot schema.
 pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
+    var snapshot = try parseSnapshotFields(alloc, value);
+    errdefer snapshot.deinit(alloc);
+    try validateSnapshot(snapshot);
+    return snapshot;
+}
+
+/// Caller owns the result. Only historical separate-cache accounting may
+/// become unavailable; malformed or versioned snapshots remain errors.
+pub fn parseLegacySnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
+    var snapshot = try parseSnapshotFields(alloc, value);
+    errdefer snapshot.deinit(alloc);
+    if (try validateSnapshotContract(snapshot, isUnversionedSnapshot(value))) return snapshot;
+
+    snapshot.deinit(alloc);
+    return .{
+        .billing = .legacy,
+        .api_duration_complete = false,
+        .wall_duration_complete = false,
+        .code_complete = false,
+        .next_sequence = 1,
+        .settled_through_sequence = 0,
+        .api_duration_ms = 0,
+        .wall_duration_ms = 0,
+        .total_cost = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .billable_web_search_calls = 0,
+        .lines_added = 0,
+        .lines_removed = 0,
+        .models = &.{},
+        .pending = &.{},
+    };
+}
+
+fn isUnversionedSnapshot(value: std.json.Value) bool {
+    return value == .object and value.object.count() == 18;
+}
+
+pub fn supports_snapshot_schema(schema_version: u64) bool {
+    return schema_version == 2 or schema_version == 3;
+}
+
+fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
     if (value != .object) {
         return error.InvalidUsageSnapshot;
     }
-    const legacy = value.object.count() == 18;
+    const legacy = isUnversionedSnapshot(value);
     const schema_version = if (legacy)
         @as(u64, 1)
     else
         try parseNonNegativeInteger(value.object.get("schema_version"));
     if (!legacy) {
-        if (value.object.count() != 23 or (schema_version != 2 and schema_version != 3)) {
+        if (value.object.count() != 23 or !supports_snapshot_schema(schema_version)) {
             return error.InvalidUsageSnapshot;
         }
     }
@@ -2928,7 +3139,6 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         .publication_backlog = publication_backlog,
         .incidents = incidents,
     };
-    try validateSnapshot(snapshot);
     return snapshot;
 }
 
@@ -2949,18 +3159,18 @@ fn writeOptionalU64(writer: *std.Io.Writer, value: ?u64) !void {
 fn reconciliationThreadMain(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []u8,
+    credential: ?[]u8,
     authority: ReconciliationAuthority,
     providers: generation_usage.Set,
 ) void {
-    defer secret.zeroAndFree(alloc, api_key);
+    defer if (credential) |api_key| secret.zeroAndFree(alloc, api_key);
     defer usage.reconciliation_done.store(true, .seq_cst);
     var observed_epoch = usage.reconciliation_work_epoch.load(.seq_cst);
     while (!usage.reconciliation_cancel.load(.seq_cst)) {
         reconcilePendingBlocking(
             usage,
             alloc,
-            api_key,
+            credential,
             &usage.reconciliation_cancel,
             authority,
             providers,
@@ -2981,22 +3191,47 @@ fn reconciliationThreadMain(
     }
 }
 
+fn publicationDrainThreadMain(usage: *Usage) void {
+    defer usage.publication_drain_done.store(true, .seq_cst);
+    var observed_epoch = usage.publication_drain_epoch.load(.seq_cst);
+    while (!usage.publication_drain_cancel.load(.seq_cst)) {
+        usage.flushProfilePublications();
+        if (usage.publication_drain_cancel.load(.seq_cst)) return;
+        const current_epoch = usage.publication_drain_epoch.load(.seq_cst);
+        if (current_epoch != observed_epoch) {
+            observed_epoch = current_epoch;
+            continue;
+        }
+        usage.publication_drain_done.store(true, .seq_cst);
+        if (usage.publication_drain_cancel.load(.seq_cst)) return;
+        const confirmed_epoch = usage.publication_drain_epoch.load(.seq_cst);
+        if (confirmed_epoch == observed_epoch) return;
+        usage.publication_drain_done.store(false, .seq_cst);
+        observed_epoch = confirmed_epoch;
+    }
+}
+
 fn reconciliationKeyDigest(api_key: []const u8) [Sha256.digest_length]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(api_key, &digest, .{});
     return digest;
 }
 
+fn hostManagedReconciliationDigest() [Sha256.digest_length]u8 {
+    return reconciliationKeyDigest("fx-host-managed-auth-v1");
+}
+
 fn reconcilePendingBlocking(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []const u8,
+    credential: ?[]const u8,
     cancel_flag: *std.atomic.Value(bool),
     authority: ReconciliationAuthority,
     providers: generation_usage.Set,
     max_attempts: usize,
 ) void {
-    if (api_key.len == 0 or cancel_flag.load(.seq_cst)) return;
+    if (credential) |api_key| if (api_key.len == 0) return;
+    if (cancel_flag.load(.seq_cst)) return;
     var attempt: usize = 0;
     while (attempt < max_attempts and !cancel_flag.load(.seq_cst)) : (attempt += 1) {
         var current = usage.snapshot(alloc) catch |err| {
@@ -3013,7 +3248,7 @@ fn reconcilePendingBlocking(
 
         var retry_needed = false;
         for (current.pending) |pending| {
-            if (pending.provider != authority.provider or
+            if (!pending.provider.same_authority(authority.provider) or
                 !optionalCredentialIdentitiesEqual(
                     pending.credential_identity,
                     authority.credential_identity,
@@ -3026,7 +3261,7 @@ fn reconcilePendingBlocking(
                 continue;
             };
             var outcome = provider.lookup(alloc, .{
-                .credential = api_key,
+                .credential = credential,
                 .tenant = pending.team,
                 .origin = pending.origin,
                 .generation_id = pending.id,
@@ -3257,7 +3492,8 @@ fn canonicalExactGenerationId(
     try validateExternalGenerationId(external_id);
     var digest: [Sha256.digest_length]u8 = undefined;
     var hash = Sha256.init(.{});
-    hash.update(@tagName(provider));
+    hash.update(provider.label());
+    if (provider == .configured) if (provider.configured.binding) |binding| hash.update(&binding);
     hash.update(&.{0});
     hash.update(external_id);
     hash.final(&digest);
@@ -3272,7 +3508,31 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .gateway => "exact/gateway",
         .codex => "exact/codex",
         .grok => "exact/grok",
+        .configured => "exact/configured",
     };
+}
+
+test "live context usage keeps the newest completed provider observation" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.observeContextUsage(2, .{ .input_tokens = 30, .output_tokens = 7 });
+    usage.observeContextUsage(1, .{ .input_tokens = 1, .output_tokens = 1 });
+    const snapshot = usage.liveContextSnapshot().?;
+    try std.testing.expectEqual(@as(u64, 37), snapshot.used);
+    try std.testing.expectEqual(@as(?f64, 0), snapshot.complete_cost);
+}
+
+test "newer missing context usage clears the prior observation" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.observeContextUsage(1, .{ .input_tokens = 30, .output_tokens = 7 });
+    usage.observeContextUsage(2, .{ .input_tokens = 40 });
+    try std.testing.expect(usage.liveContextSnapshot() == null);
+
+    usage.observeContextUsage(1, .{ .input_tokens = 90, .output_tokens = 10 });
+    try std.testing.expect(usage.liveContextSnapshot() == null);
 }
 
 test "direct exact generation IDs are deterministic and provider scoped" {
@@ -3408,7 +3668,7 @@ fn parseCredentialSourceOptional(value: ?std.json.Value) !?types.CredentialSourc
     const actual = value orelse return error.InvalidUsageSnapshot;
     return switch (actual) {
         .null => null,
-        .string => |text| types.parseCredentialSource(text) orelse return error.InvalidUsageSnapshot,
+        .string => |text| types.parseRuntimeCredentialSource(text) orelse return error.InvalidUsageSnapshot,
         else => error.InvalidUsageSnapshot,
     };
 }
@@ -3495,6 +3755,34 @@ test "usage snapshot JSON round trips" {
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(snapshot.billing, decoded.billing);
     try std.testing.expectEqual(snapshot.wall_duration_ms, decoded.wall_duration_ms);
+}
+
+test "host-managed deferred usage authority round trips" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    const identity = credential_authority.derive(.host_managed, null).?;
+    const observation = try InvocationObservation.begin(&usage);
+    try observation.complete(alloc, .{}, .{ .deferred = .{
+        .provider = .gateway,
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .scope = "https://ai-gateway.vercel.sh",
+        .credential_source = .host_managed,
+        .credential_identity = identity,
+    } });
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeSnapshot(&encoded.writer, snapshot);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    var decoded = try parseSnapshotValue(alloc, parsed.value);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expectEqual(types.CredentialSource.host_managed, decoded.pending[0].credential_source.?);
+    try std.testing.expect(decoded.pending[0].credential_identity.?.eql(identity));
 }
 
 test "profile recovery hint follows unresolved durable usage" {
@@ -4047,6 +4335,138 @@ test "fresh usage aggregates authoritative generations in invocation order" {
     try std.testing.expectError(error.InvalidUsageSnapshot, validateSnapshot(snapshot));
 }
 
+fn legacyUsageForTest(alloc: Allocator) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"billing":"complete","api_duration_complete":true,"wall_duration_complete":true,"code_complete":true,"next_sequence":2,"settled_through_sequence":1,
+        \\"api_duration_ms":10,"wall_duration_ms":20,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0,"lines_added":0,"lines_removed":0,
+        \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]}
+    , .{});
+}
+
+test "legacy usage compatibility preserves valid snapshots and strict parsing" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    var strict = try parseSnapshotValue(alloc, parsed.value);
+    defer strict.deinit(alloc);
+    var compatible = try parseLegacySnapshotValue(alloc, parsed.value);
+    defer compatible.deinit(alloc);
+    try std.testing.expect(snapshotEql(strict, compatible));
+
+    for ([_][]const u8{ "cache_read_tokens", "cache_write_tokens" }) |field| {
+        const global = parsed.value.object.getPtr(field).?;
+        const model = parsed.value.object.getPtr("models").?.array.items[0].object.getPtr(field).?;
+        const saved = global.*;
+        global.* = .{ .integer = 11 };
+        model.* = global.*;
+        var unavailable = try parseLegacySnapshotValue(alloc, parsed.value);
+        defer unavailable.deinit(alloc);
+        try validateSnapshot(unavailable);
+        try std.testing.expectEqual(Availability.legacy, unavailable.billing);
+        try std.testing.expectEqual(@as(usize, 0), unavailable.models.len);
+        try std.testing.expectEqual(@as(usize, 0), unavailable.pending.len);
+        try std.testing.expectError(error.InvalidUsageSnapshot, parseSnapshotValue(alloc, parsed.value));
+        global.* = saved;
+        model.* = saved;
+    }
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRichSnapshot(&encoded.writer, strict);
+    var rich = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer rich.deinit();
+    var rich_copy = try parseLegacySnapshotValue(alloc, rich.value);
+    defer rich_copy.deinit(alloc);
+    try std.testing.expect(snapshotEql(strict, rich_copy));
+    rich.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    rich.value.object.getPtr("models").?.array.items[0].object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, rich.value));
+}
+
+test "legacy usage compatibility does not hide malformed accounting" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    parsed.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    const model = &parsed.value.object.getPtr("models").?.array.items[0];
+    model.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+
+    const cases = [_]struct {
+        field: []const u8,
+        value: std.json.Value,
+        want: error{ InvalidGenerationRecord, InvalidUsageSnapshot },
+    }{
+        .{ .field = "total_cost", .value = .{ .float = -1 }, .want = error.InvalidGenerationRecord },
+        .{ .field = "total_cost", .value = .{ .float = std.math.inf(f64) }, .want = error.InvalidGenerationRecord },
+        .{ .field = "input_tokens", .value = .{ .integer = 9 }, .want = error.InvalidUsageSnapshot },
+        .{ .field = "next_sequence", .value = .{ .integer = 0 }, .want = error.InvalidUsageSnapshot },
+    };
+    for (cases) |case| {
+        const field = parsed.value.object.getPtr(case.field).?;
+        const saved = field.*;
+        field.* = case.value;
+        try std.testing.expectError(case.want, parseLegacySnapshotValue(alloc, parsed.value));
+        try std.testing.expectError(case.want, parseSnapshotValue(alloc, parsed.value));
+        field.* = saved;
+    }
+    model.object.getPtr("first_sequence").?.* = .{ .integer = 0 };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    model.object.getPtr("first_sequence").?.* = .{ .integer = 1 };
+    const models = parsed.value.object.getPtr("models").?;
+    try models.array.append(models.array.items[0]);
+    const totals = [_]struct { field: []const u8, original: i64, doubled: i64 }{
+        .{ .field = "total_cost", .original = 1, .doubled = 2 },
+        .{ .field = "input_tokens", .original = 10, .doubled = 20 },
+        .{ .field = "output_tokens", .original = 3, .doubled = 6 },
+        .{ .field = "cache_read_tokens", .original = 11, .doubled = 22 },
+    };
+    for (totals) |field| parsed.value.object.getPtr(field.field).?.* = .{ .integer = field.doubled };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    models.array.items.len = 1;
+    for (totals) |field| parsed.value.object.getPtr(field.field).?.* = .{ .integer = field.original };
+
+    var pending = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"id\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":0,\"origin\":\"https://ai-gateway.vercel.sh\",\"team\":null}]", .{});
+    defer pending.deinit();
+    const pending_field = parsed.value.object.getPtr("pending").?;
+    const old_pending = pending_field.*;
+    pending_field.* = pending.value;
+    parsed.value.object.getPtr("billing").?.* = .{ .string = "pending" };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    pending_field.* = old_pending;
+    parsed.value.object.getPtr("billing").?.* = .{ .string = "complete" };
+    try parsed.value.object.put(parsed.arena.allocator(), "unknown", .null);
+    try std.testing.expectError(error.InvalidGenerationRecord, parseLegacySnapshotValue(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, .null));
+}
+
+test "legacy usage compatibility releases rejected and unavailable allocations" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    parsed.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    parsed.value.object.getPtr("models").?.array.items[0].object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    const Check = struct {
+        fn run(a: Allocator, value: std.json.Value, reject: bool) !void {
+            if (reject) {
+                if (parseLegacySnapshotValue(a, value)) |result| {
+                    var owned = result;
+                    owned.deinit(a);
+                    return error.ExpectedInvalidUsage;
+                } else |err| switch (err) {
+                    error.InvalidUsageSnapshot => return,
+                    else => return err,
+                }
+            }
+            var snapshot = try parseLegacySnapshotValue(a, value);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(Availability.legacy, snapshot.billing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, false });
+    parsed.value.object.getPtr("input_tokens").?.* = .{ .integer = 9 };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, true });
+}
+
 test "usage deduplicates terminal and generation callbacks" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
@@ -4570,7 +4990,8 @@ const TestGenerationUsageProvider = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         self.calls += 1;
         self.saw_expected_input =
-            std.mem.eql(u8, input.credential, "credential") and
+            input.credential != null and
+            std.mem.eql(u8, input.credential.?, "credential") and
             std.mem.eql(
                 u8,
                 input.generation_id,
@@ -5728,4 +6149,48 @@ test "resumed provider reconciliation uses Gateway credential slot identity" {
     try std.testing.expect(usage.reconciliation_key_digest == null);
     try std.testing.expect(usage.reconciliation_authority == null);
     try std.testing.expect(usage.reconciliation_credential_blocked);
+}
+
+test "host-managed reconciliation records authority without credential bytes" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.replaceHostManagedReconciliationAuthority(std.testing.allocator, .gateway);
+
+    try std.testing.expect(usage.reconciliation_key_digest != null);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, usage.reconciliation_authority.?.provider);
+    try std.testing.expect(usage.reconciliation_authority.?.credential_identity.?.eql(
+        credential_authority.derive(.host_managed, null).?,
+    ));
+    try std.testing.expect(!usage.reconciliation_credential_blocked);
+}
+
+test "terminal checkpoint writer failure stops invocation completion and releases its lock" {
+    const Reject = struct {
+        calls: usize = 0,
+        fn persist(raw: *anyopaque, _: Snapshot) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) return error.SessionPersistenceUncertain;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |deferred| {
+        var reject = Reject{};
+        var usage = Usage.initFresh();
+        defer usage.deinit(alloc);
+        usage.configureCheckpointSink(.{ .context = &reject, .allocator = alloc, .persist = Reject.persist });
+        const observation = try InvocationObservation.begin(&usage);
+        try std.testing.expectError(error.SessionPersistenceUncertain, observation.complete(
+            alloc,
+            .{ .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+            if (deferred) testGatewayUsageOutcome("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", false) else .{ .unavailable = .unbilled },
+        ));
+        try std.testing.expectEqual(@as(usize, 2), reject.calls);
+        try std.testing.expect(usage.checkpoint_mutex.tryLock());
+        usage.checkpoint_mutex.unlock(io_mod.getIo());
+        var snapshot = try usage.snapshot(alloc);
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    }
 }

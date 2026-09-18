@@ -2,64 +2,18 @@ const std = @import("std");
 const builtin_skills = @import("../../builtins/skills.zig");
 const context_limits = @import("../../core/config/context_limits.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
-const result_store = @import("../../core/session/result_store.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
-const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 
 const Allocator = std.mem.Allocator;
-const legacy_result_limit: usize = 8;
-
-const Input = tool_args.OwnedSearchQueryInput;
 
 const ProjectionCheck = union(enum) {
     valid,
     invalid,
     identity_changed: usize,
 };
-
-pub fn decode(
-    ctx: tool_dispatch.DispatchContext,
-    args_json: []const u8,
-) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    return switch (try tool_args.decodeOwnedSearchQuery(ctx.allocator, args_json, "skill_search")) {
-        .failure => |body| .{ .failure = body },
-        .input => |input| .{ .input = .{ .ptr = input, .deinit_fn = tool_args.destroyOwnedSearchQueryInput } },
-    };
-}
-
-pub fn validate(
-    _: tool_dispatch.DispatchContext,
-    _: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!?[]u8 {
-    return null;
-}
-
-pub fn call(
-    ctx: tool_dispatch.DispatchContext,
-    erased: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const input = erased.as(Input);
-    const model_output = searchRequest(
-        ctx,
-        .{
-            .query = &input.prepared,
-            .kind = .skill,
-            .limit = legacy_result_limit,
-        },
-        @min(ctx.max_tool_result_bytes, result_store.large_result_threshold_bytes),
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
-            "skill_search failed: {s}",
-            .{@errorName(err)},
-        ) },
-    };
-    return .{ .success = model_output };
-}
 
 pub fn searchRequest(
     ctx: tool_dispatch.DispatchContext,
@@ -72,7 +26,7 @@ pub fn searchRequest(
         ctx.skills_dir,
     );
     defer discovery.deinit(ctx.allocator);
-    skill_runtime.traceDiagnostics("skill_search", discovery.diagnostics);
+    skill_runtime.traceDiagnostics("capability_search", discovery.diagnostics);
     try reportDiagnostics(ctx, discovery.diagnostics);
 
     return renderProjectedSearch(
@@ -82,14 +36,6 @@ pub fn searchRequest(
         ctx.context_limits.skill_description_bytes,
         max_bytes,
     );
-}
-
-pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
-    return true;
-}
-
-pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
-    return false;
 }
 
 fn reportDiagnostics(
@@ -163,7 +109,7 @@ fn renderProjectedSearch(
 
         const projected = @constCast(try tool_result_limits.prepareModelOutput(
             alloc,
-            "skill_search",
+            "capability_search",
             raw,
             max_bytes,
         ));
@@ -180,7 +126,7 @@ fn renderProjectedSearch(
             .valid => {
                 const second = try tool_result_limits.prepareModelOutput(
                     alloc,
-                    "skill_search",
+                    "capability_search",
                     projected,
                     max_bytes,
                 );
@@ -289,52 +235,6 @@ fn checkProjection(
     return .valid;
 }
 
-test "skill search decoder enforces the shared query bounds" {
-    const alloc = std.testing.allocator;
-    const accepted_json = try std.fmt.allocPrint(alloc, "{{\"query\":\"{s}\"}}", .{"a" ** 4096});
-    defer alloc.free(accepted_json);
-    const accepted = try decode(.{ .allocator = alloc }, accepted_json);
-    switch (accepted) {
-        .input => |input| input.deinit(alloc),
-        .failure => |message| {
-            defer alloc.free(message);
-            return error.TestUnexpectedResult;
-        },
-    }
-
-    const too_long_json = try std.fmt.allocPrint(alloc, "{{\"query\":\"{s}\"}}", .{"a" ** 4097});
-    defer alloc.free(too_long_json);
-    const too_long = try decode(.{ .allocator = alloc }, too_long_json);
-    switch (too_long) {
-        .failure => |message| alloc.free(message),
-        .input => |input| {
-            input.deinit(alloc);
-            return error.TestUnexpectedResult;
-        },
-    }
-
-    var token_query: std.Io.Writer.Allocating = .init(alloc);
-    defer token_query.deinit();
-    for (0..65) |index| {
-        if (index > 0) try token_query.writer.writeByte(' ');
-        try token_query.writer.writeAll("token");
-    }
-    const too_many_tokens_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"query\":\"{s}\"}}",
-        .{token_query.written()},
-    );
-    defer alloc.free(too_many_tokens_json);
-    const too_many_tokens = try decode(.{ .allocator = alloc }, too_many_tokens_json);
-    switch (too_many_tokens) {
-        .failure => |message| alloc.free(message),
-        .input => |input| {
-            input.deinit(alloc);
-            return error.TestUnexpectedResult;
-        },
-    }
-}
-
 test "skill search ranks metadata and returns final-projection-stable JSON" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{
@@ -344,7 +244,7 @@ test "skill search ranks metadata and returns final-projection-stable JSON" {
     const query = try lexical_relevance.prepare("review fx runtime public");
     const output = try renderProjectedSearch(
         alloc,
-        .{ .query = &query, .kind = .skill, .limit = legacy_result_limit },
+        .{ .query = &query, .kind = .skill, .limit = capability_retrieval.default_limit },
         &skills,
         (context_limits.Values{}).skill_description_bytes,
         4096,
@@ -353,30 +253,30 @@ test "skill search ranks metadata and returns final-projection-stable JSON" {
     try std.testing.expect(std.mem.find(u8, output, "\"name\":\"fx-review\"") != null);
     try std.testing.expect(std.mem.find(u8, output, "\"count\":1") != null);
 
-    const projected_again = try tool_result_limits.prepareModelOutput(alloc, "skill_search", output, 4096);
+    const projected_again = try tool_result_limits.prepareModelOutput(alloc, "capability_search", output, 4096);
     defer alloc.free(@constCast(projected_again));
     try std.testing.expectEqualStrings(output, projected_again);
 }
 
-test "skill search omits projected identities and permits redacted descriptions" {
+test "skill search preserves projected identities and verbatim descriptions" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{
-        .{ .name = "unsafe-location", .description = "Review files", .path = "/skills/TOKEN=runtime-location-secret/SKILL.md", .source = .workspace_fx },
-        .{ .name = "safe", .description = "API_KEY=runtime-description-secret", .path = "/skills/safe/SKILL.md", .source = .workspace_fx },
+        .{ .name = "unsafe-location", .description = "Review files", .path = "/skills/TOKEN=path-secret-value", .source = .workspace_fx },
+        .{ .name = "safe", .description = "API_KEY=description-secret-value", .path = "/skills/safe/SKILL.md", .source = .workspace_fx },
     };
     const query = try lexical_relevance.prepare("");
     const output = try renderProjectedSearch(
         alloc,
-        .{ .query = &query, .kind = .skill, .limit = legacy_result_limit },
+        .{ .query = &query, .kind = .skill, .limit = capability_retrieval.default_limit },
         &skills,
         (context_limits.Values{}).skill_description_bytes,
         4096,
     );
     defer alloc.free(output);
-    try std.testing.expect(std.mem.find(u8, output, "unsafe-location") == null);
+    try std.testing.expect(std.mem.find(u8, output, "unsafe-location") != null);
     try std.testing.expect(std.mem.find(u8, output, "\"name\":\"safe\"") != null);
-    try std.testing.expect(std.mem.find(u8, output, "API_KEY=[redacted]") != null);
-    try std.testing.expect(std.mem.find(u8, output, "\"count\":1") != null);
+    try std.testing.expect(std.mem.find(u8, output, "API_KEY=description-secret-value") != null);
+    try std.testing.expect(std.mem.find(u8, output, "\"count\":2") != null);
     try std.testing.expect(std.mem.find(u8, output, "\"more_available\":false") != null);
 }
 
@@ -396,7 +296,7 @@ test "skill search caps ranked entries and atomically omits byte overflow" {
     const query = try lexical_relevance.prepare("");
     const output = try renderProjectedSearch(
         alloc,
-        .{ .query = &query, .kind = .skill, .limit = legacy_result_limit },
+        .{ .query = &query, .kind = .skill, .limit = capability_retrieval.default_limit },
         &skills,
         (context_limits.Values{}).skill_description_bytes,
         1024,
@@ -406,37 +306,10 @@ test "skill search caps ranked entries and atomically omits byte overflow" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
     defer parsed.deinit();
     const entries = parsed.value.object.get("skills").?.array.items;
-    try std.testing.expect(entries.len < legacy_result_limit);
+    try std.testing.expect(entries.len < capability_retrieval.default_limit);
     try std.testing.expect(entries.len > 0);
     try std.testing.expect(parsed.value.object.get("more_available").?.bool);
     try std.testing.expectEqual(@as(usize, @intCast(parsed.value.object.get("count").?.integer)), entries.len);
-}
-
-test "skill search decoder releases every accepted-input allocation failure" {
-    const Case = struct {
-        fn run(alloc: Allocator) !void {
-            const decoded = try decode(.{ .allocator = alloc }, "{\"query\":\"review runtime\"}");
-            switch (decoded) {
-                .input => |input| input.deinit(alloc),
-                .failure => |message| alloc.free(message),
-            }
-        }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
-}
-
-test "skill search decoder releases every rejected-input allocation failure" {
-    const Case = struct {
-        fn run(alloc: Allocator) !void {
-            const args_json = "{\"query\":\"" ++ ("token " ** 64) ++ "token\"}";
-            const decoded = try decode(.{ .allocator = alloc }, args_json);
-            switch (decoded) {
-                .input => |input| input.deinit(alloc),
-                .failure => |message| alloc.free(message),
-            }
-        }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "skill search projection releases every allocation failure" {
@@ -456,7 +329,7 @@ test "skill search projection releases every allocation failure" {
             const query = try lexical_relevance.prepare("");
             const output = try renderProjectedSearch(
                 alloc,
-                .{ .query = &query, .kind = .skill, .limit = legacy_result_limit },
+                .{ .query = &query, .kind = .skill, .limit = capability_retrieval.default_limit },
                 &skills,
                 (context_limits.Values{}).skill_description_bytes,
                 1024,

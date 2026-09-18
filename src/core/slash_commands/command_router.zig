@@ -10,17 +10,12 @@ pub const ParsedCommand = union(enum) {
     new_session,
     reset_session,
     resume_session,
-    continue_recovery,
     rename_session: []const u8,
     help,
     login,
     logout: []const u8,
-    setup,
+    provider,
     status,
-    background,
-    background_stop: []const u8,
-    background_open: []const u8,
-    background_logs: []const u8,
     image: []const u8,
     images: []const u8,
     model: []const u8,
@@ -54,16 +49,11 @@ pub const CommandHandlers = struct {
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
-    continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    setup: *const fn (ctx: *anyopaque) anyerror!void,
+    provider: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
-    show_background: *const fn (ctx: *anyopaque) anyerror!void,
-    stop_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
-    open_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
-    show_background_logs: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
@@ -102,17 +92,12 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .new_session => .new_session,
         .reset_session => .reset_session,
         .resume_session => .resume_session,
-        .continue_recovery => .continue_recovery,
         .rename_session => .{ .rename_session = payload },
         .help => .help,
         .login => .login,
         .logout => .{ .logout = payload },
-        .setup => .setup,
+        .provider => .provider,
         .status => .status,
-        .background => .background,
-        .background_stop => .{ .background_stop = payload },
-        .background_open => .{ .background_open = payload },
-        .background_logs => .{ .background_logs = payload },
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
@@ -159,17 +144,12 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
-        .continue_recovery => try handlers.continue_recovery(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
-        .setup => try handlers.setup(handlers.ctx),
+        .provider => try handlers.provider(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
-        .background => try handlers.show_background(handlers.ctx),
-        .background_stop => |target| try handlers.stop_background(handlers.ctx, target),
-        .background_open => |target| try handlers.open_background(handlers.ctx, target),
-        .background_logs => |target| try handlers.show_background_logs(handlers.ctx, target),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
@@ -221,7 +201,7 @@ test "parse rejects removed plural model command" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
 }
 
-test "parse leaves provider selection to setup" {
+test "provider arguments belong to the inline picker, not the router" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/provider codex"));
 }
 
@@ -252,10 +232,6 @@ test "parse recognizes interactive resume" {
     try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
 }
 
-test "parse recognizes explicit recovery continuation" {
-    try std.testing.expectEqual(ParsedCommand.continue_recovery, parse(testSlashRegistry(), "/continue"));
-}
-
 test "parse recognizes logout" {
     switch (parse(testSlashRegistry(), "/logout")) {
         .unknown => return error.TestExpectedLogoutCommand,
@@ -270,25 +246,7 @@ test "parse rejects removed slash commands" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/review"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/history"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/rules"));
-}
-
-test "parse extracts background stop target" {
-    const parsed = parse(testSlashRegistry(), "/background stop last");
-    switch (parsed) {
-        .background_stop => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "parse extracts background open and logs targets" {
-    switch (parse(testSlashRegistry(), "/background open 3")) {
-        .background_open => |target| try std.testing.expectEqualStrings("3", target),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/background logs last")) {
-        .background_logs => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/background"));
 }
 
 test "parse extracts image commands" {
@@ -451,10 +409,6 @@ fn recordResumeSession(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "resume";
 }
 
-fn recordContinueRecovery(ctx: *anyopaque) anyerror!void {
-    testContext(ctx).called = "continue_recovery";
-}
-
 fn recordModel(ctx: *anyopaque, value: []const u8) anyerror!void {
     const test_context = testContext(ctx);
     test_context.called = "model";
@@ -498,16 +452,11 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
-        .continue_recovery = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
-        .setup = unexpectedNoPayload,
+        .provider = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
-        .show_background = unexpectedNoPayload,
-        .stop_background = unexpectedPayload,
-        .open_background = unexpectedPayload,
-        .show_background_logs = unexpectedPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
@@ -555,16 +504,6 @@ test "route calls interactive resume handler" {
     try route(testSlashRegistry(), &handlers, "/resume");
 
     try std.testing.expectEqualStrings("resume", ctx.called);
-}
-
-test "route calls explicit recovery continuation handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.continue_recovery = recordContinueRecovery;
-
-    try route(testSlashRegistry(), &handlers, "/continue");
-
-    try std.testing.expectEqualStrings("continue_recovery", ctx.called);
 }
 
 test "route forwards borrowed payload slice" {

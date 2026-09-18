@@ -9,25 +9,27 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
+const shared_theme = @import("../../core/shared/theme.zig");
+
 const reset_style = "\x1b[0m";
 const prompt_text_style = "\x1b[1m";
 const restore_prompt_text_style = reset_style ++ prompt_text_style;
 const user_turn_rail = "┃";
-const dark_marker_style = "\x1b[38;5;255m";
-const light_marker_style = "\x1b[38;5;235m";
 const osc8_prefix = "\x1b]8;;";
 const osc8_terminator = "\x1b\\";
 const osc8_close = osc8_prefix ++ osc8_terminator;
 
-const accent_dark = "\x1b[38;5;252m";
-const accent_light = "\x1b[38;5;238m";
-var accent_style: []const u8 = accent_dark;
+var accent_style: []const u8 = shared_theme.fx_dark.user_card_accent_style;
 
-var marker_style: []const u8 = dark_marker_style;
+var marker_style: []const u8 = shared_theme.fx_dark.user_card_marker_style;
 
-pub fn setStyle(light: bool, _: ?Rgb) void {
-    marker_style = if (light) light_marker_style else dark_marker_style;
-    accent_style = if (light) accent_light else accent_dark;
+pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
+    applyTheme(shared_theme.builtin(light), terminal_bg);
+}
+
+pub fn applyTheme(theme: shared_theme.Theme, _: ?Rgb) void {
+    marker_style = theme.user_card_marker_style;
+    accent_style = theme.user_card_accent_style;
 }
 
 pub fn promptMarkerStyle() []const u8 {
@@ -281,10 +283,6 @@ fn renderSkillTokensForCard(
         try out.writer.writeAll(text[pos..token.raw_start]);
         try out.writer.writeAll(accent_style);
         try out.writer.writeAll(token.name);
-        if (visual_layout.skillTokenSourceLabel(token)) |source_label| {
-            try out.writer.writeAll(visual_layout.skill_source_separator);
-            try out.writer.writeAll(source_label);
-        }
         try out.writer.writeAll(restore_prompt_text_style);
         pos = token.raw_end;
     }
@@ -569,7 +567,7 @@ test "buildUserPromptCardWithSkillTokens colors selected skills without dollar p
     try std.testing.expect(std.mem.find(u8, card, "$review") == null);
 }
 
-test "buildUserPromptCardWithSkillTokens labels an ambiguous source" {
+test "buildUserPromptCardWithSkillTokens hides an ambiguous source" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
     const tokens = [_]visual_layout.SkillTokenSpan{.{
@@ -582,7 +580,8 @@ test "buildUserPromptCardWithSkillTokens labels an ambiguous source" {
     const card = try buildUserPromptCardWithSkillTokens(alloc, "use $review now", &.{}, 80, &tokens);
     defer alloc.free(card);
 
-    try std.testing.expect(std.mem.find(u8, card, "review · workspace .codex") != null);
+    try std.testing.expect(std.mem.find(u8, card, "review") != null);
+    try std.testing.expect(std.mem.find(u8, card, "workspace .codex") == null);
     try std.testing.expect(std.mem.find(u8, card, "$review") == null);
 }
 

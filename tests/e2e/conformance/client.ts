@@ -34,6 +34,10 @@ if (requestedProtocol && !supportedProtocols.has(requestedProtocol)) {
   console.error(`unsupported conformance protocol: ${requestedProtocol}`);
   process.exit(2);
 }
+const conformanceEnv = {
+  ...process.env,
+  FX_MCP_PROTOCOL_VERSION: requestedProtocol ?? "2026-07-28",
+};
 let configuredServerUrl = serverUrl;
 let legacyProbeProxy: LegacyProbeProxy | null = null;
 if (requestedProtocol && requestedProtocol !== "2026-07-28") {
@@ -61,7 +65,7 @@ if (scenario === "sep-2322-client-request-state") {
     ],
     {
       cwd: repoRoot,
-      env: process.env,
+      env: conformanceEnv,
       stdout: "pipe",
       stderr: "pipe",
     },
@@ -131,7 +135,7 @@ const gatewaySteps = toolCalls.flatMap((call, index) => {
 if (toolCalls.length === 0) {
   gatewaySteps.push(fakeGatewayToolCall(
     "search_conformance_server",
-    "mcp_search_tools",
+    "capability_search",
     { query: "conformance" },
   ));
 }
@@ -151,7 +155,7 @@ try {
     {
       cwd: workspace,
       env: {
-        ...process.env,
+        ...conformanceEnv,
         HOME: home,
         AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
         VERCEL_OIDC_TOKEN: "",

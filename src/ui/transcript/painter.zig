@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const render_engine = @import("../render_engine.zig");
@@ -377,7 +378,8 @@ fn foldedPartialTailBytes(self: anytype, bytes: []const u8, partial_skip_rows: u
 }
 
 fn foldedLineBytes(alloc: Allocator, text: []const u8, stream: command_output_content.Stream) ![]u8 {
-    const style = if (stream == .stderr) "\x1b[38;5;252m" else "\x1b[38;5;245m";
+    const theme = shared_theme.current();
+    const style = if (stream == .stderr) theme.tool_stderr_style else theme.tool_stdout_style;
     const trimmed = stripTrailingNewline(text);
     const reset = "\x1b[0m";
     const bytes = try alloc.alloc(u8, style.len + "│ ".len + trimmed.len + reset.len);
@@ -1305,6 +1307,7 @@ fn prepareTranscriptSurfacePaintWithOwnedSource(
         true,
         false,
         .apply,
+        null,
     );
     if (source.bytes.len > 0) {
         prepared.owns_bytes = true;
@@ -1330,6 +1333,7 @@ pub fn prepareTranscriptSurfacePaintFromSourceForArea(
         false,
         false,
         .apply,
+        null,
     );
 }
 
@@ -1350,6 +1354,7 @@ pub fn preparePreselectedTranscriptSurfacePaintFromSourceForArea(
         false,
         false,
         .skip,
+        null,
     );
 }
 
@@ -1371,6 +1376,29 @@ pub fn prepareTranscriptSurfacePaintFromSourceForFrame(
         false,
         allow_projection_rebase,
         .apply,
+        null,
+    );
+}
+
+pub fn prepareIndexedFullTranscriptSurfacePaintForArea(
+    self: anytype,
+    alloc: Allocator,
+    metrics: *Metrics,
+    source: *const TranscriptPreparationSource,
+    area: render_engine.frame_layout.FrameRect,
+    visual_offset: u32,
+) !PreparedTranscriptSurfacePaint {
+    return prepareTranscriptSurfacePaintInternal(
+        self,
+        alloc,
+        metrics,
+        0,
+        area,
+        source,
+        false,
+        false,
+        .skip,
+        visual_offset,
     );
 }
 
@@ -1649,6 +1677,7 @@ fn prepareTranscriptSurfacePaintInternal(
     commit_runtime_state: bool,
     allow_projection_rebase: bool,
     resize_history_policy: ResizeHistoryPolicy,
+    forced_visual_offset: ?u32,
 ) !PreparedTranscriptSurfacePaint {
     if (commit_runtime_state) try self.ensurePaintReservation(alloc);
 
@@ -1789,7 +1818,6 @@ fn prepareTranscriptSurfacePaintInternal(
     var repl_line_idx: usize = total_lines;
     var tracked_visible_line: ?usize = null;
     const precomputed_plain_lines =
-        !self.fullTranscriptActive() and
         !effective_replaceable_last_line and
         tracked_entry_start_line == null and
         total_lines == transcript_line_count and
@@ -2038,6 +2066,41 @@ fn prepareTranscriptSurfacePaintInternal(
             welcome_decision = .none;
             self.tail_viewport_resolution = resolution;
         }
+    }
+    if (forced_visual_offset) |visual_offset| {
+        const remaining_visual_rows = projectionRemainingVisualRows(
+            &prepared,
+            visual_offset,
+        ) orelse return error.InvalidTranscriptTransition;
+        const projection_rows = @min(
+            remaining_visual_rows,
+            @as(u32, visible_rows),
+        );
+        if (projection_rows == 0) return error.InvalidTranscriptTransition;
+        const visual_end = visual_offset + projection_rows;
+        const start = sourceStartPosition(&prepared, visual_offset) orelse
+            return error.InvalidTranscriptTransition;
+        const boundary = preparedProjectionBoundary(
+            &prepared,
+            self.layout.cols,
+            visual_end,
+        ) orelse return error.InvalidTranscriptTransition;
+        try replacePreparedProjectionResumeBytes(
+            alloc,
+            &prepared,
+            self.layout.cols,
+            visual_offset,
+        );
+        prepared.projection_visual_rows = @intCast(projection_rows);
+        prepared.projection_ends_with_newline = boundary.line_terminated;
+        viewport_selection_snapshot.start_line = start.line;
+        viewport_selection_snapshot.partial_skip_rows = start.intra_line_rows;
+        viewport_selection_snapshot.line_count = prepared.sourceVisibleLines().len;
+        viewport_selection_snapshot.last_visible_row = 0;
+        viewport_selection_snapshot.last_visible_row_blank = false;
+        viewport_selection_snapshot.replaceable_start_row = top_row;
+        rows_budget = visible_rows - @as(u16, @intCast(projection_rows));
+        welcome_decision = .none;
     }
     const start_line = viewport_selection_snapshot.start_line;
     const partial_skip_rows = viewport_selection_snapshot.partial_skip_rows;
@@ -2729,9 +2792,25 @@ pub fn prepareTranscriptDocumentAppendBytes(
         return error.InvalidTranscriptTransition;
     }
 
+    var append = try prepareTranscriptDocumentAppend(alloc, bytes, cols, raw_start, raw_end, close_endpoint);
+    defer append.deinit(alloc);
+    const result = append.bytes;
+    append.bytes = &.{};
+    return result;
+}
+
+/// Owns wire bytes and the source boundary needed for a cursor-addressed append.
+pub fn prepareTranscriptDocumentAppend(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_start: usize,
+    raw_end: usize,
+    close_endpoint: bool,
+) !PreparedResumeDocumentAppend {
     var start = try prepareControlBoundary(alloc, bytes, cols, raw_start);
     defer start.deinit(alloc);
-    var append = try prepareResumeDocumentAppend(
+    return prepareResumeDocumentAppend(
         alloc,
         bytes,
         cols,
@@ -2745,10 +2824,6 @@ pub fn prepareTranscriptDocumentAppendBytes(
         },
         true,
     );
-    defer append.deinit(alloc);
-    const result = append.bytes;
-    append.bytes = &.{};
-    return result;
 }
 
 test "document append preparation emits terminal-ready newlines" {
@@ -2802,6 +2877,7 @@ test "document append preparation preserves presentation boundaries" {
 
 pub const PreparedResumeDocumentAppend = struct {
     bytes: []u8 = &.{},
+    start_pending_wrap: bool = false,
     endpoint_resume_bytes: []u8 = &.{},
     endpoint_pending_wrap: bool = false,
     endpoint_cursor_col: u16 = 1,
@@ -2848,6 +2924,7 @@ pub fn prepareResumeDocumentAppend(
     if (close_endpoint) try state.writePresentationSteady(&steady_writer.writer);
 
     var result = PreparedResumeDocumentAppend{
+        .start_pending_wrap = start.pending_wrap,
         .endpoint_pending_wrap = state.pending_wrap,
         .endpoint_cursor_col = state.cursor_col,
     };
@@ -3345,11 +3422,6 @@ fn paintTranscriptIntoSurfaceWithLimit(
     };
 }
 
-const TestFullRepaintMode = enum {
-    enabled,
-    diagnostic_wipe_only,
-};
-
 const TestFooterGeometry = struct {
     top: u16 = 0,
 };
@@ -3525,7 +3597,6 @@ fn testPaintPlan(layout: types.Layout, selection: ViewportSelection) paint_plan.
         .footer_clean_allowed = true,
         .synchronized_update = false,
         .cursor_target = null,
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -4091,6 +4162,22 @@ test "transcript surface painter preserves OSC 8 links through target-grid diff"
     try diff_prev.feed(diff_buf.items);
     const diff_cell = diff_prev.cellAt(1, 1).?;
     try std.testing.expectEqualStrings("https://example.com", diff_prev.hyperlinkUrl(diff_cell.style.hyperlink_id).?);
+}
+
+fn expectAppendBoundaryAllocation(alloc: Allocator) !void {
+    const raw = "\x1b[31m\x1b]8;;https://example.com\x1b\\12345678X\nY\n";
+    const start = raw.len - "X\nY\n".len;
+    var prepared = prepareTranscriptDocumentAppend(alloc, raw, 8, start, raw.len, true) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer prepared.deinit(alloc);
+    try std.testing.expect(prepared.start_pending_wrap);
+    try std.testing.expect(std.mem.find(u8, prepared.bytes, "X\r\nY\r\n") != null);
+}
+
+test "append pending wrap preparation allocation failures release owned boundaries" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectAppendBoundaryAllocation, .{});
 }
 
 test "resume document append matches full prefix replay" {

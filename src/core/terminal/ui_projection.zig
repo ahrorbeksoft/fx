@@ -86,7 +86,6 @@ pub const Store = struct {
             .screen => |value| try self.upsert(alloc, value.session, null),
             .write => |value| try self.upsert(alloc, value.session, null),
             .wait => |value| try self.upsert(alloc, value.session, null),
-            .monitor => |value| try self.upsert(alloc, value.session, null),
             .resize => |value| try self.upsert(alloc, value.session, null),
             .signal => |value| try self.upsert(alloc, value.session, null),
             .close => |value| try self.upsert(alloc, value.session, null),
