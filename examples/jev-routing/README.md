@@ -47,7 +47,9 @@ The commands above disable fast mode to measure model choice independently.
 On low confidence, unavailable evaluation or invalid answers, retain the previous
 eligible routed model when available, otherwise Kimi. A missing eligible fallback
 fails closed. Evaluation has a ten-second maximum deadline and honors cancellation.
-Paused recovery reuses its recorded model without reclassification.
+Paused recovery reuses its recorded model without reclassification. Routing
+choices are saved in optional turn metadata so resumed prompts preserve continuity.
+Sessions created with this experiment require a build that understands that metadata.
 
 Set `FX_TRACE_LOG` and include `quality` in `FX_TRACE_SCOPES` to record one
 `event=jev_route` with JSON decision data per routing boundary: origin, selected
