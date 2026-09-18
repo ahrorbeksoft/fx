@@ -14,7 +14,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
   const model = "fixture/compaction";
-  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, fast_mode: false, auto_upgrade: false }), { mode: 0o600 });
   const originalUser = "Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>" +
     (userHeavy ? "\n" + "user_reference_abcdefghijklmnop ".repeat(10_000) + "USER_REFERENCE_END" : "");
   const assistant = "VERIFIED_VALUE=73\n" + Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("") + "PENDING_CHECK=transport-resume\n";
@@ -44,7 +44,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
   const env = {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     AI_GATEWAY_API_KEY: "synthetic-compaction-policy", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model,
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_FAST_MODE: "0", FX_MODEL: model,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
@@ -104,12 +104,13 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
 const { TmuxSession, fakeShellRun, tmuxAvailable } = await import("./tmux-helpers");
 const { readdirSync } = await import("node:fs");
 
-test.skipIf(!tmuxAvailable())("Jev native transport commits extractive memory and resumes the built binary", async () => {
+for (const routing of [false, true]) test.skipIf(!tmuxAvailable())(`Jev native transport commits extractive memory and resumes the built binary (routing=${routing})`, async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-jev-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(cwd);
-  const model = "fixture/jev";
-  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false, yolo_acknowledged: true, permission_mode: "full-access" }));
-  let calls = 0, summaries = 0, evaluations = 0;
+  const candidates = ["moonshotai/kimi-k3", "openai/gpt-5.6-luna", "openai/gpt-5.6-sol"];
+  const model = routing ? "jev/auto" : "fixture/jev";
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, fast_mode: false, auto_upgrade: false, yolo_acknowledged: true, permission_mode: "full-access" }));
+  let calls = 0, summaries = 0, evaluations = 0, routeEvaluations = 0;
   const gateway = startDynamicFakeGateway((raw: string) => {
     const request = JSON.parse(raw);
     if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
@@ -119,21 +120,29 @@ test.skipIf(!tmuxAvailable())("Jev native transport commits extractive memory an
     calls++;
     if (calls <= 16) return fakeShellRun(`jev-result-${calls}`, `printf 'EXACT_JEV_RESULT_${calls}_café\\n'; python3 -c "print('old tool data ' * 800)"`);
     return fakeGatewayFinalText(`JEV_VISIBLE_DONE_${calls}`);
-  }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+  }, { models: (routing ? candidates : [model]).map(id => ({ id, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 })) });
   const evaluator = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     expect(request.headers.get("ai-model-id")).toBe("typesafe-ai/jev");
     const body = await request.json() as any;
     expect(body.providerOptions.gateway.zeroDataRetention).toBe(true);
+    if (body.questions.family) {
+      routeEvaluations++;
+      const choices: Record<string, string> = { family: "code-generation", taskClass: "routine" };
+      return Response.json({ answers: Object.fromEntries(Object.entries(body.questions).map(([key, q]: [string, any]) => [key, {
+        type: "choice", choice: choices[key], probabilities: Object.fromEntries(Object.keys(q.criteria).map(label => [label, Number(label === choices[key])])),
+      }])), usage: { inputTokens: 123, outputTokens: 4 } });
+    }
     expect(body.state).toContain("EXACT_JEV_RESULT_1");
     evaluations++;
     return Response.json({ answers: Object.fromEntries(Object.keys(body.questions).map((key, i) => [key, { type: "boolean", probability: i === 1 ? 0.99 : 0.01 }])), usage: { inputTokens: 123, outputTokens: 5 } });
   }});
   let tui: InstanceType<typeof TmuxSession> | undefined;
+  const stderrPath = join(root, "tty-stderr.log");
   let passed = false;
   try {
-    tui = await TmuxSession.create({ cwd, env: {
+    tui = await TmuxSession.create({ cwd, stderrPath, env: {
       HOME: home, TMPDIR: root, AI_GATEWAY_API_KEY: "synthetic-jev", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_PERMISSION_MODE: "full-access",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_FAST_MODE: "0", FX_MODEL: model, FX_PERMISSION_MODE: "full-access",
       FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       FX_EXPERIMENT_JEV_COMPACTION: "1", FX_E2E_JEV_URL: `http://127.0.0.1:${evaluator.port}/evaluate`,
@@ -164,6 +173,12 @@ test.skipIf(!tmuxAvailable())("Jev native transport commits extractive memory an
     expect(readFileSync(log).subarray(0, before.length).equals(before)).toBe(true);
     await tui.waitForComposer(20000);
     await tui.sendText("Continue after Jev compaction."); await tui.waitForText("JEV_VISIBLE_DONE_20", 20000);
+    expect(routeEvaluations).toBe(routing ? 4 : 0);
+    expect(gateway.requests.every(r => r.headers.get("ai-language-model-id") === (routing ? candidates[1] : model))).toBe(true);
+    const trace = readFileSync(join(root, "trace.log"), "utf8");
+    expect(trace).toContain("event=jev_completed ");
+    if (routing) expect(trace).toContain('"policy":"jev-assignment-v2"');
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
     passed = true;
   } finally {
     await tui?.kill(); gateway.stop(); evaluator.stop(true);
