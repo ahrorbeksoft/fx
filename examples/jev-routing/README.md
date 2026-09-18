@@ -21,7 +21,10 @@ option. `jev/auto` is an fx selection mode; it is never sent as an inference
 model to Gateway. A concrete parent or child model bypasses Jev. The child switch
 affects creation defaults; existing pinned children remain pinned and existing
 auto children remain automatic. A child can also explicitly request `jev/auto`.
-All candidates use the current Gateway credential and team.
+All inference candidates use the current Gateway credential and team. Jev
+evaluations can use a separate `FX_JEV_GATEWAY_API_KEY` and optional
+`FX_JEV_GATEWAY_TEAM`, so evaluation billing does not move inference billing.
+The dedicated key never inherits the inference team header.
 
 Jev receives the current assignment, bounded role/objective excerpts and recent
 conversation messages. This includes previous assistant text needed to interpret
@@ -76,7 +79,9 @@ GPT 5.6 Luna and GPT 5.6 Sol. Low confidence or evaluator failure retains Kimi K
 Explicit model choices bypass evaluation. Model availability, tool/vision
 requirements and context limits are enforced before selection.
 
-Requires Node 22+ and `AI_GATEWAY_API_KEY` or `VERCEL_OIDC_TOKEN` in the environment.
+Requires Node 22+ and `AI_GATEWAY_API_KEY` or `VERCEL_OIDC_TOKEN` for inference.
+Set `FX_JEV_GATEWAY_API_KEY` to bill only Jev evaluation to a separate account;
+`FX_JEV_GATEWAY_TEAM` optionally scopes that evaluation credential.
 The Gateway team must permit TypeSafe AI and each candidate model. No dependencies
 or installation step are needed. The provider catalog is a dated snapshot, not
 proof that the current account has access.

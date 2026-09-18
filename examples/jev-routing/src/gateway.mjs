@@ -2,8 +2,10 @@ export const EVALUATION_URL = 'https://ai-gateway.vercel.sh/v4/ai/evaluation-mod
 
 /** Uses the same documented wire contract as GatewayEvaluationModel in vercel/ai. */
 export async function evaluate(state, questions, options = {}) {
-  const credential = options.apiKey ?? process.env.AI_GATEWAY_API_KEY ?? process.env.VERCEL_OIDC_TOKEN;
-  if (!credential) throw new Error('Set AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN.');
+  const dedicated = process.env.FX_JEV_GATEWAY_API_KEY;
+  const credential = options.apiKey ?? dedicated ?? process.env.AI_GATEWAY_API_KEY ?? process.env.VERCEL_OIDC_TOKEN;
+  if (!credential) throw new Error('Missing evaluation credential.');
+  const teamId = options.teamId ?? (options.apiKey === undefined && dedicated !== undefined ? process.env.FX_JEV_GATEWAY_TEAM : undefined);
   const started = performance.now();
   const response = await (options.fetch ?? fetch)(EVALUATION_URL, {
     method: 'POST', redirect: 'error',
@@ -12,7 +14,7 @@ export async function evaluate(state, questions, options = {}) {
       authorization: `Bearer ${credential}`, 'content-type': 'application/json',
       'ai-gateway-protocol-version': '0.0.1',
       'ai-evaluation-model-specification-version': '4', 'ai-model-id': 'typesafe-ai/jev',
-      ...(options.teamId ? { 'x-vercel-ai-gateway-team': options.teamId } : {}),
+      ...(teamId ? { 'x-vercel-ai-gateway-team': teamId } : {}),
     },
     body: JSON.stringify({ state, questions, providerOptions: { gateway: { zeroDataRetention: true } } }),
   });
