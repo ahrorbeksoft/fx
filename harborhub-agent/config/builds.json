@@ -1,0 +1,36 @@
+{
+  "main": {
+    "file": "fx-main",
+    "sourceCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "sha256": "7568262975013e450471da27fda1a67025376785835b57fdb57e4d62e61db16c",
+    "bytes": 12286088,
+    "zigVersion": "0.16.0",
+    "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
+    "status": "built-clean-source"
+  },
+  "patch-retry": {
+    "file": "fx-patch-retry",
+    "sourceCommit": "29cc1c23f866e8678e94f6df4c2107bb4cbe6cb4",
+    "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "featureCommits": {
+      "applyPatch": "af3c6adcbd29ace6a0951f6093449c7b718f554f",
+      "adaptiveRetry": "490fa9e4181b42b751633b9a20eb7f1c9a10b1cf"
+    },
+    "sha256": "eec95e57e3d5765e97b36dfb3f4f0476e5f766cb2d80db746a1e79de4e4c53d3",
+    "bytes": 12329880,
+    "zigVersion": "0.16.0",
+    "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
+    "status": "built-clean-source"
+  },
+  "compaction": {
+    "file": "fx-compaction",
+    "sourceCommit": "2d817e68a868200453015b496b779f32f84012fd",
+    "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "sha256": "b8e4d668b1cd358767c5974446c889278c51d6920d4922ce260c00fd04969c85",
+    "bytes": 12305704,
+    "zigVersion": "0.16.0",
+    "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
+    "status": "built-clean-source"
+  }
+}
