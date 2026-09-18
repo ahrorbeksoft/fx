@@ -109,7 +109,7 @@ test("native Jev resumed uncertainty keeps the last selected eligible model", as
   } finally { f.close(passed); }
 }, 45_000);
 
-test("native Jev routes persistent child assignments independently and holds each route through tools", async () => {
+for (const parentAuto of [false, true]) test(`native Jev routes persistent child assignments independently (parentAuto=${parentAuto})`, async () => {
   const { fakeGatewayToolCall, fakeShellRun } = await import("./tmux-helpers");
   let parentCalls = 0;
   const childModels: string[] = [];
@@ -124,14 +124,15 @@ test("native Jev routes persistent child assignments independently and holds eac
     if (parentCalls === 1) return fakeGatewayToolCall("delegate-first", "subagent", { request: { action: "message", agent: "worker", message: "SMALL_CHILD: format a string." } });
     if (parentCalls === 2) return fakeGatewayToolCall("delegate-second", "subagent", { request: { action: "message", agent: "worker", message: "HARD_CHILD: investigate a deadlock." } });
     return fakeGatewayFinalText("PARENT_DONE");
-  }, body => body.state.split("ORIGIN:")[0].includes("HARD_CHILD") ? "demanding" : "routine");
+  }, body => body.state.includes("ORIGIN: root") ? "general" : body.state.split("ORIGIN:")[0].includes("HARD_CHILD") ? "demanding" : "routine");
   let passed = false;
   try {
-    const result = await f.ask("Delegate the two child assignments.", ["--model", candidates[0]], { FX_EXPERIMENT_JEV_SUBAGENT_ROUTING: "1" });
+    const result = await f.ask("Delegate the two child assignments.", parentAuto ? [] : ["--model", candidates[0]], { FX_EXPERIMENT_JEV_SUBAGENT_ROUTING: "1" });
     expect(result.output).toBe("PARENT_DONE");
-    expect(f.evaluations).toHaveLength(2);
-    expect(f.evaluations.every(e => e.state.includes("ORIGIN: subagent"))).toBe(true);
-    expect(f.evaluations[1].state).toContain("SMALL_CHILD");
+    expect(f.evaluations).toHaveLength(parentAuto ? 3 : 2);
+    const childEvaluations = f.evaluations.filter(e => e.state.includes("ORIGIN: subagent"));
+    expect(childEvaluations).toHaveLength(2);
+    expect(childEvaluations[1].state).toContain("SMALL_CHILD");
     expect(childModels[0]).toBe(candidates[1]);
     expect(childModels[1]).toBe(candidates[1]);
     expect(childModels.at(-1)).toBe(candidates[2]);
