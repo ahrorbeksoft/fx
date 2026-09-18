@@ -1,7 +1,4 @@
 const std = @import("std");
-const background_runtime = @import("../background/background_runtime.zig");
-const change_tracker = @import("change_tracker.zig");
-const session_runtime = @import("../session/session.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -133,6 +130,8 @@ pub const InitialContextInput = struct {
     targets: []const ApplicableTarget = &.{},
     omissions: []const ContextOmissionInput = &.{},
     omission_summary: ?ContextOmissionSummary = null,
+    /// Internal request reconstruction only; ordinary gathers retain their work limits.
+    bounded_reconstruction: bool = false,
     context_limits: context_limits.Values = .{},
 };
 
@@ -252,9 +251,9 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
-    tracker: ?*change_tracker.ChangeTracker,
-    background: *background_runtime.BackgroundRuntime,
-    session: *session_runtime.SessionRuntime,
+    /// True when the resumed session history references shell execution handles
+    /// the current process does not own; the model must not reuse them.
+    stale_shell_handles: bool = false,
 };
 
 pub const Provider = struct {
@@ -279,6 +278,22 @@ pub const Provider = struct {
     pub fn appendTransient(self: Provider, input: TransientContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
         return self.append_transient_fn(input, alloc, messages);
     }
+};
+
+fn gather_empty_context(_: Allocator, _: InitialContextInput) ProviderError!ProviderContext {
+    return .{};
+}
+
+fn append_no_context(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+fn append_no_transient_context(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+pub const empty_provider = Provider{
+    .id = "core.empty_context",
+    .gather_project_context_fn = gather_empty_context,
+    .select_applicable_project_context_fn = selectNoApplicableProjectContext,
+    .append_static_fn = append_no_context,
+    .append_transient_fn = append_no_transient_context,
 };
 
 pub fn selectNoApplicableProjectContext(_: Allocator, _: LaterContextInput) ProviderError!ProviderContext {
@@ -425,13 +440,11 @@ pub const EntryPoint = enum {
 pub const DriftStatus = enum {
     intentional,
     temporary,
-    phase12_follow_up,
 
     fn label(self: DriftStatus) []const u8 {
         return switch (self) {
             .intentional => "intentional",
             .temporary => "temporary",
-            .phase12_follow_up => "phase12_follow_up",
         };
     }
 };
@@ -499,7 +512,7 @@ const current_inventory = [_]EntrypointInventory{
         .transient_context = "tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path",
         .tools = "identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children",
         .permission = "per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect",
-        .session = "ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration",
+        .session = "internal child session resumed for write by its saved parent, canonical child history restored from and committed back to that session, and persistent agent instructions plus model and effort from the parent's immutable profile snapshot",
         .drift_status = .intentional,
         .drift = "separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging",
     },
@@ -683,7 +696,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  transient_context: tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path
         \\  tools: identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children
         \\  permission: per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect
-        \\  session: ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration
+        \\  session: internal child session resumed for write by its saved parent, canonical child history restored from and committed back to that session, and persistent agent instructions plus model and effort from the parent's immutable profile snapshot
         \\  drift_status: intentional
         \\  drift: separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging
         \\
@@ -762,12 +775,6 @@ test "context registry routes the default provider" {
     defer snapshot.deinit(alloc);
     const contribution = snapshot.contribution orelse return error.TestExpectedEqual;
 
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var session: session_runtime.SessionRuntime = .{ .max_history_turns = 4 };
-    defer session.deinit(alloc);
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -779,9 +786,6 @@ test "context registry routes the default provider" {
         .workspace_root = "/workspace",
         .interactive = true,
         .permission_mode = .ask,
-        .tracker = &tracker,
-        .background = &background,
-        .session = &session,
     }, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);

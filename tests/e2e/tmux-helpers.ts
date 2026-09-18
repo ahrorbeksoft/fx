@@ -10,13 +10,11 @@ import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
 
 export const FAKE_GATEWAY_MODEL = "openai/gpt-5";
-export const POST_TOOL_DECISION_PROMPT =
-  "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const TMUX_CAPTURE_MAX_BUFFER = 32 * 1024 * 1024;
 const TMUX_HEX_CHUNK_BYTES = 256;
 const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;
@@ -38,6 +36,11 @@ const MIRRORED_ENV_KEYS = [
   "FX_MAX_AGENT_STEPS",
   "FX_MODEL",
 ] as const;
+
+export function canonicalSubagentIdForStore(childId: string): string {
+  const match = /^(\d+)-(\d{6})-([0-9a-f]{16})$/.exec(childId);
+  return match ? `${match[1]}-${match[1]}${match[2]}-${match[3]}` : childId;
+}
 
 export function terminalFixtureShell(): string {
   for (const path of ["/bin/zsh", "/bin/bash"]) {
@@ -150,6 +153,21 @@ export function fakeGatewayToolCall(
   ]);
 }
 
+export function fakeShellRun(
+  id: string,
+  command: string,
+  options: Record<string, unknown> = {},
+) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: {
+      yield_time_ms: 30_000,
+      ...options,
+      action: "run",
+      command,
+    },
+  });
+}
+
 export function fakeGatewayPermissionDecision(
   decision: "clear" | "caution" = "clear",
   toolCallId = "permission_decision_1",
@@ -160,15 +178,6 @@ export function fakeGatewayPermissionDecision(
     decision,
     rationale,
   });
-}
-
-export function classifierEvidenceFromRequest(body: string): string {
-  const parsed = JSON.parse(body) as any;
-  const instruction = parsed.prompt.at(-1);
-  if (instruction?.role !== "system" || typeof instruction.content !== "string") {
-    throw new Error("classifier instruction missing");
-  }
-  return instruction.content;
 }
 
 export function fakeGatewaySerializedToolCall(
@@ -316,11 +325,38 @@ export type FakeGatewayOptions = {
       | Promise<FakeGatewayModel[] | Response>);
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
+  titleResponses?: FakeGatewayResponse[];
   generationResponse?: (
     generationId: string,
     request: Request,
   ) => Response | Promise<Response>;
 };
+
+// Session title generation calls carry this instruction regardless of the
+// provider protocol. Fake servers route them to their own channel so they
+// never consume queued completion responses; the default is a finish-only
+// stream so the call completes without text deltas (which would pollute
+// SSE trace assertions) and without a usable title, leaving the locally
+// derived title in place for tests that do not opt in.
+export const TITLE_GENERATION_MARKER = "Generate a short title";
+
+export function fakeGatewayTitleDefault() {
+  return fakeGatewaySse([{
+    type: "finish",
+    finishReason: { unified: "stop", raw: "stop" },
+    usage: { inputTokens: { total: 2 }, outputTokens: { total: 0 } },
+  }]);
+}
+
+// Finish-only Responses-protocol stream for title generation side calls at
+// Codex/Grok fake servers: completes without text deltas and without usable
+// title content, leaving the locally derived session title in place.
+export function fakeResponsesTitleDefault() {
+  return new Response(
+    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
 
 function serveFakeGateway(
   nextCompletion: (body: string) => Response | Promise<Response>,
@@ -329,6 +365,8 @@ function serveFakeGateway(
   const requests: Array<{ body: string; headers: Headers }> = [];
   const classifierRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
+  const titleRequests: Array<{ body: string; headers: Headers }> = [];
+  const titleResponses = [...(options.titleResponses ?? [])];
   const modelRequests: FakeGatewayModelRequest[] = [];
   const generationRequests: string[] = [];
   const server = Bun.serve({
@@ -366,15 +404,22 @@ function serveFakeGateway(
         if (next) return typeof next === "function" ? await next(body) : next;
         return fakeGatewayPermissionDecision(options.classifierDecision ?? "clear");
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) {
+        titleRequests.push({ body, headers });
+        const next = titleResponses.shift();
+        if (next) return typeof next === "function" ? await next(body) : next;
+        return fakeGatewayTitleDefault();
+      }
       requests.push({ body, headers });
       return nextCompletion(body);
     },
   });
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
+    titleRequests,
     generationRequests,
     modelRequests,
     requestCount() {
@@ -438,7 +483,7 @@ export class TmuxSession {
     const {
       cmd = FX_BIN,
       cwd = REPO_ROOT,
-      env = {},
+      env: requestedEnv = {},
       width = 120,
       height = 40,
       stderrPath,
@@ -448,6 +493,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
+    const env = providerVersionTestEnv(requestedEnv);
 
     if (
       minimumHistoryLines !== undefined &&
@@ -710,6 +756,26 @@ export class TmuxSession {
       stdio: "pipe",
     });
     await sleep(100);
+  }
+
+  // Interrupt active work: the first Escape arms the interrupt gesture, and a
+  // confirming press within the one-second window cancels. The confirm press
+  // is retried once when a runner stall let the arm expire between presses
+  // (the hint reappearing means the second press re-armed instead of firing).
+  async sendInterruptEscapePair(hintTimeoutMs = 15_000): Promise<void> {
+    await this.sendKeys("Escape");
+    await this.waitForText("esc again to interrupt", hintTimeoutMs);
+    await sleep(150);
+    await this.sendKeys("Escape");
+    await sleep(250);
+    const pane = await this.capturePane();
+    if (
+      pane.includes("esc again to interrupt") ||
+      pane.includes("esc esc interrupt") ||
+      pane.includes("esc esc to interrupt")
+    ) {
+      await this.sendKeys("Escape");
+    }
   }
 
   sendKeysImmediate(keys: readonly string[]): void {

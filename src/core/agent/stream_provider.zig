@@ -18,6 +18,7 @@ pub const ToolStartCallback = *const fn (
     tool_id: []const u8,
     tool_name: []const u8,
     label_value: ?[]const u8,
+    arguments_json: ?[]const u8,
 ) void;
 
 pub const Event = union(enum) {
@@ -27,6 +28,8 @@ pub const Event = union(enum) {
         id: []const u8,
         name: []const u8,
         label: ?[]const u8 = null,
+        /// Complete arguments borrowed only for synchronous event delivery.
+        arguments_json: ?[]const u8 = null,
     },
     tool_input_delta: []const u8,
 };
@@ -85,6 +88,13 @@ pub const ProviderAttemptOwner = enum {
 pub const NetworkFailureCause = enum {
     transport_interrupted,
     system_resumed,
+    /// The network path is provably down (refused, unreachable, DNS). Nothing
+    /// was sent; probing it costs nothing and never consumes a provider
+    /// attempt.
+    connectivity_lost,
+    /// The stream produced no bytes past the stall threshold. Positive
+    /// evidence that this exchange is dead; restarting it is the recovery.
+    stream_stalled,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.
@@ -131,6 +141,7 @@ pub const DynamicFunctionTool = struct {
     name: []const u8,
     description: []const u8,
     input_schema: std.json.Value,
+    mcp_binding: ?types.McpToolBinding = null,
 };
 
 pub const ToolSelection = struct {
@@ -148,17 +159,21 @@ pub const ToolSelection = struct {
     }
 };
 
-pub const CredentialLease = struct {
-    secret: []const u8,
-    source: ?types.CredentialSource = null,
-    account_id: ?[]const u8 = null,
-    tenant: ?[]const u8 = null,
-};
+pub const CredentialLease = types.CredentialLease;
+
+test "host-managed credential lease exposes no secret or account metadata" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, lease.credentialSource().?);
+}
 
 /// Pure provider input used by request serializers and permission reviewers.
 /// Every slice and JSON value is borrowed for the call.
 pub const RequestData = struct {
     model: []const u8,
+    instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
@@ -168,15 +183,44 @@ pub const RequestData = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+
+    pub fn validatePrompt(self: RequestData) error{InvalidProviderPrompt}!void {
+        try validate_prompt_lanes(self.instructions, self.messages);
+    }
 };
+
+pub fn validate_prompt_lanes(
+    instructions: []const types.ChatMessage,
+    messages: []const types.ChatMessage,
+) error{InvalidProviderPrompt}!void {
+    for (instructions) |instruction| {
+        if (instruction.role != .system or
+            instruction.content == null or
+            instruction.images.len != 0 or
+            instruction.tool_call_id != null or
+            instruction.tool_name != null or
+            instruction.tool_calls.len != 0 or
+            instruction.provider_replay != null or
+            instruction.tool_result_status != null or
+            instruction.tool_result_memory != null or
+            instruction.permission_feedback)
+        {
+            return error.InvalidProviderPrompt;
+        }
+    }
+    for (messages) |message| {
+        if (message.role == .system) return error.InvalidProviderPrompt;
+    }
+}
 
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
-    credential: CredentialLease,
+    credential: types.CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,
+    instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
@@ -186,6 +230,9 @@ pub const ModelRequest = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+    /// Exact provider body already built for capacity measurement. Borrowed
+    /// for this call and valid until `stream` returns.
+    prepared_request_body: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
     /// Optional absolute provider deadline. Transports that support bounded
@@ -202,6 +249,7 @@ pub const ModelRequest = struct {
     pub fn data(self: ModelRequest) RequestData {
         return .{
             .model = self.model,
+            .instructions = self.instructions,
             .messages = self.messages,
             .tools = self.tools,
             .tool_choice = self.tool_choice,
@@ -263,6 +311,9 @@ pub const Completed = struct {
     completion: types.ModelCompletion = .{},
     usage: UsageOutcome = .{ .unavailable = .unbilled },
     ownership: ResultOwnership = .borrowed,
+    /// Native references normally borrow completion/credential fields. Copies
+    /// escaping a request allocator own their reference strings separately.
+    usage_ownership: ResultOwnership = .borrowed,
 };
 
 pub const Failure = struct {
@@ -277,6 +328,53 @@ pub const Result = union(enum) {
     completed: Completed,
     failed: Failure,
 
+    /// Returns a fully owned copy, including deferred usage and diagnostics.
+    /// The caller releases it with deinit using the same allocator.
+    pub fn dupe(self: Result, alloc: Allocator) Allocator.Error!Result {
+        switch (self) {
+            .failed => |failure| {
+                var copy = Result{ .failed = failure };
+                copy.failed.ownership = .owned;
+                copy.failed.detail = null;
+                copy.failed.diagnostics = .{};
+                errdefer copy.deinit(alloc);
+                if (failure.detail) |value| copy.failed.detail = try alloc.dupe(u8, value);
+                if (failure.diagnostics.schema) |value| copy.failed.diagnostics.schema = try alloc.dupe(u8, value);
+                if (failure.diagnostics.request_shape) |value| copy.failed.diagnostics.request_shape = try alloc.dupe(u8, value);
+                return copy;
+            },
+            .completed => |completed| {
+                var copy = Result{ .completed = completed };
+                copy.completed.ownership = .owned;
+                copy.completed.usage = .{ .unavailable = .unbilled };
+                copy.completed.usage_ownership = .owned;
+                const dst = &copy.completed.completion;
+                const src = completed.completion;
+                const strings = .{ "content", "generation_id", "provider_failure_detail", "provider_state_json" };
+                inline for (strings) |field| @field(dst, field) = null;
+                dst.tool_calls = &.{};
+                dst.billing = null;
+                errdefer copy.deinit(alloc);
+                inline for (strings) |field| {
+                    if (@field(src, field)) |value| @field(dst, field) = try alloc.dupe(u8, value);
+                }
+                dst.tool_calls = try types.dupeToolCallSlice(alloc, src.tool_calls);
+                if (src.billing) |billing| {
+                    var owned = billing;
+                    owned.model = try alloc.dupe(u8, billing.model);
+                    dst.billing = owned;
+                }
+                // Publish the union only after its fallible payload is complete.
+                const usage: UsageOutcome = switch (completed.usage) {
+                    .deferred => |reference| .{ .deferred = try dupeUsageReference(alloc, reference) },
+                    else => completed.usage,
+                };
+                copy.completed.usage = usage;
+                return copy;
+            },
+        }
+    }
+
     /// Providers mark allocated response fields as `owned`; test and embedded
     /// providers may return stable borrowed fields instead.
     pub fn deinit(self: *Result, alloc: Allocator) void {
@@ -288,6 +386,15 @@ pub const Result = union(enum) {
                 types.freeToolCallSlice(alloc, @constCast(completed.completion.tool_calls));
                 if (completed.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
                 if (completed.completion.provider_state_json) |state| alloc.free(@constCast(state));
+                if (completed.usage_ownership == .owned) switch (completed.usage) {
+                    .deferred => |reference| {
+                        alloc.free(reference.generation_id);
+                        alloc.free(reference.scope);
+                        if (reference.tenant) |value| alloc.free(value);
+                        if (reference.account_id) |value| alloc.free(value);
+                    },
+                    else => {},
+                };
             },
             .failed => |failure| if (failure.ownership == .owned) {
                 if (failure.detail) |detail| alloc.free(detail);
@@ -298,6 +405,117 @@ pub const Result = union(enum) {
         self.* = undefined;
     }
 };
+
+fn dupeUsageReference(alloc: Allocator, source: DeferredUsageReference) Allocator.Error!DeferredUsageReference {
+    const generation_id = try alloc.dupe(u8, source.generation_id);
+    errdefer alloc.free(generation_id);
+    const scope = try alloc.dupe(u8, source.scope);
+    errdefer alloc.free(scope);
+    const tenant = if (source.tenant) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (tenant) |value| alloc.free(value);
+    const account_id = if (source.account_id) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .provider = source.provider,
+        .generation_id = generation_id,
+        .scope = scope,
+        .tenant = tenant,
+        .account_id = account_id,
+        .credential_source = source.credential_source,
+        .credential_identity = source.credential_identity,
+    };
+}
+
+test "owned stream result copies survive the source allocator and allocation failures" {
+    const source = Result{ .completed = .{
+        .completion = .{
+            .content = "answer",
+            .tool_calls = &.{.{
+                .id = "call_1",
+                .name = "read_file",
+                .arguments_json = "{\"path\":\"file.txt\"}",
+                .provisional_id = "pending_1",
+                .provider_result = "provider output",
+            }},
+            .generation_id = "gen_1",
+            .provider_failure_detail = "detail",
+            .provider_state_json = "[]",
+            .billing = .{
+                .created_at_ms = 1,
+                .model = "fixture-model",
+                .total_cost = 0,
+                .input_tokens = 3,
+                .output_tokens = 1,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = null,
+                .billable_web_search_calls = 0,
+            },
+            .finish_reason = .tool_calls,
+        },
+        .usage = .{ .deferred = .{
+            .provider = .gateway,
+            .generation_id = "gen_1",
+            .scope = "http://127.0.0.1",
+            .tenant = "team",
+            .account_id = "account",
+            .credential_source = .ai_gateway_api_key,
+            .credential_identity = null,
+        } },
+    } };
+    const Copy = struct {
+        fn check(alloc: Allocator, original: Result) !void {
+            var copied = blk: {
+                var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer scratch.deinit();
+                const temporary = try original.dupe(scratch.allocator());
+                break :blk try temporary.dupe(alloc);
+            };
+            defer copied.deinit(alloc);
+            const completion = copied.completed.completion;
+            try std.testing.expectEqualStrings("answer", completion.content.?);
+            try std.testing.expectEqualStrings("gen_1", completion.generation_id.?);
+            try std.testing.expectEqualStrings("detail", completion.provider_failure_detail.?);
+            try std.testing.expectEqualStrings("[]", completion.provider_state_json.?);
+            try std.testing.expectEqualStrings("fixture-model", completion.billing.?.model);
+            try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
+            try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
+            try std.testing.expectEqualStrings("{\"path\":\"file.txt\"}", completion.tool_calls[0].arguments_json);
+            try std.testing.expectEqualStrings("pending_1", completion.tool_calls[0].provisional_id.?);
+            try std.testing.expectEqualStrings("provider output", completion.tool_calls[0].provider_result.?);
+            const reference = copied.completed.usage.deferred;
+            try std.testing.expectEqualStrings("gen_1", reference.generation_id);
+            try std.testing.expectEqualStrings("http://127.0.0.1", reference.scope);
+            try std.testing.expectEqualStrings("team", reference.tenant.?);
+            try std.testing.expectEqualStrings("account", reference.account_id.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Copy.check, .{source});
+}
+
+test "owned failure copies preserve diagnostics after source teardown and allocation failures" {
+    const Copy = struct {
+        fn check(alloc: Allocator) !void {
+            var copied = blk: {
+                var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer scratch.deinit();
+                const source = Result{ .failed = .{
+                    .kind = .rate_limited,
+                    .detail = @constCast("retry later"),
+                    .diagnostics = .{ .schema = @constCast("schema"), .request_shape = @constCast("shape") },
+                    .retry_after_seconds = 3,
+                } };
+                const temporary = try source.dupe(scratch.allocator());
+                break :blk try temporary.dupe(alloc);
+            };
+            defer copied.deinit(alloc);
+            try std.testing.expectEqualStrings("retry later", copied.failed.detail.?);
+            try std.testing.expectEqualStrings("schema", copied.failed.diagnostics.schema.?);
+            try std.testing.expectEqualStrings("shape", copied.failed.diagnostics.request_shape.?);
+            try std.testing.expectEqual(@as(?u64, 3), copied.failed.retry_after_seconds);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Copy.check, .{});
+}
 
 pub inline fn failResult(err: anytype) @TypeOf(err)!Result {
     return @errorCast(failResultDynamic(err));
@@ -319,13 +537,43 @@ pub const StreamFn = *const fn (
     request: ModelRequest,
 ) anyerror!Result;
 
+pub const BuildRequestFn = *const fn (
+    context: ?*anyopaque,
+    alloc: Allocator,
+    request: RequestData,
+) anyerror![]u8;
+
 pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `stream` returns.
     context: ?*anyopaque = null,
     stream_fn: StreamFn,
+    /// Optional exact provider serializer used for request-capacity decisions.
+    build_request_fn: ?BuildRequestFn = null,
+    /// Pure provider-owned slicing when one reply becomes separate history units.
+    project_replay_fn: ?*const fn (Allocator, ?types.ProviderReplay, []const types.ToolCall, bool, bool) anyerror!?types.ProviderReplay = null,
+
+    /// Borrows unchanged payloads; projected payloads live in the caller's arena.
+    pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+        if (replay == null) return null;
+        const project = self.project_replay_fn orelse return error.ProviderReplayProjectionUnavailable;
+        return project(arena, replay, calls, text, reasoning);
+    }
 
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
+        try request.data().validatePrompt();
         return self.stream_fn(self.context, alloc, request);
+    }
+
+    /// Returns an owned provider request body when this provider exposes its
+    /// serializer. The caller owns the returned allocation.
+    pub fn buildRequest(
+        self: Provider,
+        alloc: Allocator,
+        request: RequestData,
+    ) !?[]u8 {
+        try request.validatePrompt();
+        const build = self.build_request_fn orelse return null;
+        return try build(self.context, alloc, request);
     }
 };
 
@@ -341,11 +589,13 @@ test "stream provider accepts one typed request and emits ordered neutral events
     const Fake = struct {
         calls: usize = 0,
         attempt_owner: ?ProviderAttemptOwner = null,
+        instruction_count: usize = 0,
 
         fn stream(raw: ?*anyopaque, _: Allocator, request: ModelRequest) anyerror!Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             self.attempt_owner = request.provider_attempt_owner;
+            self.instruction_count = request.instructions.len;
             try request.admission.admit();
             request.events.emit(.{ .content_delta = "first" });
             request.events.emit(.{ .reasoning_delta = "second" });
@@ -387,13 +637,15 @@ test "stream provider accepts one typed request and emits ordered neutral events
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
     var cancelled = std.atomic.Value(bool).init(false);
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "rules" }};
     var result = try (Provider{
         .context = &fake,
         .stream_fn = Fake.stream,
     }).stream(std.testing.allocator, .{
-        .credential = .{ .secret = "key" },
+        .credential = .{ .direct = .{ .secret_bytes = "key" } },
         .model = "model",
         .retry_count = 1,
+        .instructions = &instructions,
         .messages = &.{},
         .tools = .{},
         .tool_choice = .auto,
@@ -412,9 +664,190 @@ test "stream provider accepts one typed request and emits ordered neutral events
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), admission_capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.instruction_count);
     try std.testing.expectEqual(ProviderAttemptOwner.agent, fake.attempt_owner.?);
     try std.testing.expect(!capture.failed);
     try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
     try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
     try std.testing.expect(std.meta.activeTag(result.completed.usage) == .exact);
+}
+
+test "stream provider rejects system messages in conversation before delegation" {
+    const Fake = struct {
+        calls: usize = 0,
+
+        fn stream(raw: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .{ .completed = .{} };
+        }
+
+        fn event(_: *anyopaque, _: Event) void {}
+    };
+
+    var fake: Fake = .{};
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "rules" },
+        .{ .role = .user, .content = "hello" },
+    };
+
+    try std.testing.expectError(error.InvalidProviderPrompt, (Provider{
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    }).stream(std.testing.allocator, .{
+        .credential = .{ .direct = .{ .secret_bytes = "key" } },
+        .model = "model",
+        .retry_count = 1,
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt_evidence,
+        .events = .{ .context = &fake, .emit_fn = Fake.event },
+        .cancel_flag = &cancelled,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "stream provider exposes its exact request serializer without streaming" {
+    const Builder = struct {
+        calls: usize = 0,
+
+        fn build(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            request: RequestData,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return std.fmt.allocPrint(
+                alloc,
+                "model={s};instructions={d};messages={d};tools={d}",
+                .{ request.model, request.instructions.len, request.messages.len, request.tools.advertised_names.len },
+            );
+        }
+
+        fn stream(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ModelRequest,
+        ) anyerror!Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+
+    var builder: Builder = .{};
+    const provider = Provider{
+        .context = &builder,
+        .stream_fn = Builder.stream,
+        .build_request_fn = Builder.build,
+    };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "rules" }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hello" }};
+    const names = [_][]const u8{"terminal"};
+    const body = (try provider.buildRequest(std.testing.allocator, .{
+        .model = "test/model",
+        .instructions = &instructions,
+        .messages = &messages,
+        .tools = .{ .advertised_names = &names },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    })).?;
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expectEqual(@as(usize, 1), builder.calls);
+    try std.testing.expectEqualStrings(
+        "model=test/model;instructions=1;messages=1;tools=1",
+        body,
+    );
+}
+
+test "stream provider rejects system messages in conversation before serialization" {
+    const Builder = struct {
+        calls: usize = 0,
+
+        fn build(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            _: RequestData,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return alloc.dupe(u8, "unexpected");
+        }
+
+        fn stream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+
+    var builder: Builder = .{};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "rules" },
+        .{ .role = .user, .content = "hello" },
+    };
+    const result = (Provider{
+        .context = &builder,
+        .stream_fn = Builder.stream,
+        .build_request_fn = Builder.build,
+    }).buildRequest(std.testing.allocator, .{
+        .model = "test/model",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    if (result) |body| {
+        if (body) |owned| std.testing.allocator.free(owned);
+        return error.TestExpectedInvalidProviderPrompt;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidProviderPrompt, err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), builder.calls);
+}
+
+test "stream provider rejects non-system instructions before serialization" {
+    const Builder = struct {
+        calls: usize = 0,
+
+        fn build(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            _: RequestData,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return alloc.dupe(u8, "unexpected");
+        }
+
+        fn stream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+
+    var builder: Builder = .{};
+    const instructions = [_]types.ChatMessage{.{ .role = .user, .content = "not trusted" }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hello" }};
+    const result = (Provider{
+        .context = &builder,
+        .stream_fn = Builder.stream,
+        .build_request_fn = Builder.build,
+    }).buildRequest(std.testing.allocator, .{
+        .model = "test/model",
+        .instructions = &instructions,
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    if (result) |body| {
+        if (body) |owned| std.testing.allocator.free(owned);
+        return error.TestExpectedInvalidProviderPrompt;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidProviderPrompt, err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), builder.calls);
 }

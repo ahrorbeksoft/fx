@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
+import { fakeGatewayTitleDefault, isVolatileTokenStatusRow, TITLE_GENERATION_MARKER } from "../tmux-helpers";
 import {
   ACTIVE_TOOL_MARKER,
   analyzeRun,
@@ -130,7 +131,7 @@ const OBSERVABILITY_FINAL_MARKER = "OBSERVABILITY_FINAL_RESPONSE";
 const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
 const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
 const OBSERVABILITY_TOOL_COMMAND = "touch render-lab-observability-approved.txt";
-const LOCAL_GATEWAY_CHAT_PATH = "/v3/ai/language-model";
+const LOCAL_GATEWAY_CHAT_PATH = "/v4/ai/language-model";
 const LOCAL_GATEWAY_MODELS_PATH = "/coding-agent/v1/models";
 const DEFAULT_BENCH_SIZES: RenderLabTerminalSize[] = [
   { cols: 80, rows: 24 },
@@ -277,7 +278,7 @@ async function runSameShellRelaunch(outRoot: string, runNumber: number): Promise
         `SHELL_A_BEFORE_FIRST_${runId}`,
         `SHELL_A_BETWEEN_LAUNCHES_${runId}`,
       ],
-      submitted: ["permission_mode", "● Version:", "/help"],
+      submitted: ["permission_mode", "* version:", "/help"],
     },
     frames: [],
     failures: [],
@@ -333,7 +334,7 @@ async function runSameShellRelaunch(outRoot: string, runNumber: number): Promise
     );
 
     await launchFx(context, session, "second");
-    await submitSlashCommand(context, session, "/version", "● Version:", "second-version-visible");
+    await submitSlashCommand(context, session, "/version", "* version:", "second-version-visible");
     await resize(context, session, 72, 24, "second-resize-narrow");
     await resize(context, session, 132, 42, "second-resize-wide");
     await resize(context, session, 120, 40, "second-resize-restored");
@@ -512,7 +513,7 @@ async function runActiveToolPlacement(
 
     await session.sendKeys("C-o");
     await session.waitForPane(
-      (pane) => pane.includes("┃ Full detail · ctrl o close"),
+      (pane) => pane.includes("┃ full detail · ctrl+o close"),
       10_000,
     );
     await captureMatching(
@@ -537,7 +538,7 @@ async function runActiveToolPlacement(
       session,
       "active-tool-command-output-expanded-shrink",
       (pane) =>
-        pane.includes("┃ Full detail · ctrl o close") &&
+        pane.includes("┃ full detail · ctrl+o close") &&
         commandMoreCount(pane) === null,
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
@@ -1654,6 +1655,11 @@ function startLocalGatewayFixture(expectedPromptTail: string): LocalGatewayFixtu
     idleTimeout: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      // Title generation side calls never count as scenario gateway traffic.
+      if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
+        const bodyPeek = await request.clone().text();
+        if (bodyPeek.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      }
       requests.push(`${request.method} ${url.pathname}`);
 
       if (request.method === "GET" && url.pathname === LOCAL_GATEWAY_MODELS_PATH) {
@@ -1729,6 +1735,10 @@ function startActiveToolGatewayFixture(): LocalGatewayFixture {
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
+        const bodyPeek = await request.clone().text();
+        if (bodyPeek.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      }
       if (request.method === "GET" && url.pathname === LOCAL_GATEWAY_MODELS_PATH) {
         requests.push(`${request.method} ${url.pathname}`);
         return Response.json({ data: [{ id: "anthropic/claude-opus-4.7", type: "language", released: 1, tags: ["tool-use"] }] });
@@ -1743,9 +1753,9 @@ function startActiveToolGatewayFixture(): LocalGatewayFixture {
         if (chatRequestCount === 2) await responseGate;
         const sse = chatRequestCount === 1
           ? [
-              `data: ${JSON.stringify({ type: "tool-input-start", id: "active_tool_1", toolName: "terminal" })}`,
+              `data: ${JSON.stringify({ type: "tool-input-start", id: "active_tool_1", toolName: "shell" })}`,
               "",
-              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "terminal", input: { action: "exec", command: "sleep 1; i=1; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done", timeout_ms: 600_000 } })}`,
+              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "shell", input: { request: { action: "run", command: "sleep 1; i=1; sleep 3; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done", yield_time_ms: 30_000, timeout_ms: 600_000 } } })}`,
               "",
               `data: ${JSON.stringify({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } } })}`,
               "",
@@ -1806,6 +1816,10 @@ function startObservabilityGatewayFixture(
     idleTimeout: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
+        const bodyPeek = await request.clone().text();
+        if (bodyPeek.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      }
       if (request.method === "GET" && url.pathname === LOCAL_GATEWAY_MODELS_PATH) {
         requests.push(`${request.method} ${url.pathname}`);
         return Response.json({
@@ -1837,13 +1851,15 @@ function startObservabilityGatewayFixture(
               {
                 type: "tool-input-start",
                 id: "observability-tool-1",
-                toolName: "terminal",
+                toolName: "shell",
               },
               {
                 type: "tool-call",
                 toolCallId: "observability-tool-1",
-                toolName: "terminal",
-                input: { action: "exec", command, timeout_ms: 600_000 },
+                toolName: "shell",
+                input: {
+                  request: { action: "run", command, timeout_ms: 600_000 },
+                },
               },
               {
                 type: "finish",
@@ -2171,7 +2187,11 @@ class RenderLabTmux {
   }
 
   async waitForStableVisibleState() {
-    return waitForStableProbe(() => this.capturePane());
+    return waitForStableProbe(() =>
+      this.capturePane().split("\n").map((line) =>
+        isVolatileTokenStatusRow(line) ? "<volatile-status>" : line
+      ).join("\n")
+    );
   }
 
   captureFrame(index: number, event: string, binarySha256: string, traceLogPath: string): RenderLabFrame {

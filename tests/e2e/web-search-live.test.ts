@@ -7,7 +7,7 @@ import { HAS_API_KEY, runFx } from "../evals/eval-helpers";
 const TIMEOUT = 180_000;
 const OUTER_MODEL = "anthropic/claude-sonnet-4.6";
 const BACKENDS = [
-  "ai_gateway_perplexity_search",
+  "ai_gateway_exa_search",
   "ai_gateway_parallel_search",
 ] as const;
 
@@ -92,6 +92,7 @@ describe.skipIf(!HAS_API_KEY)("live web_search private backends", () => {
           expect(json.model).not.toContain("perplexity");
           expect(json.model).not.toContain("parallel");
           expect(json.tool_calls).toHaveLength(0);
+          expect(json.tool_calls.some((call) => call.name === "exa_search")).toBe(false);
           expect(json.tool_calls.some((call) => call.name === "perplexity_search")).toBe(false);
           expect(json.tool_calls.some((call) => call.name === "parallel_search")).toBe(false);
           expect(json.tool_calls.some((call) => call.name === "web_fetch")).toBe(false);

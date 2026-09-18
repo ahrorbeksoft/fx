@@ -1,7 +1,6 @@
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -14,10 +13,16 @@ const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const update_notes = @import("../upgrade/update_notes.zig");
+const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 
 const Allocator = std.mem.Allocator;
+
+fn providerDisplayName(provider: *const model_provider.ProviderId) []const u8 {
+    return if (provider.* == .configured) provider.label() else provider_catalog.label(provider.*);
+}
 
 fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     return permissions.permissionModeLabel(mode);
@@ -365,7 +370,7 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
+    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -461,6 +466,7 @@ pub const McpLocalSnapshot = struct {
 
 pub const StatusSnapshot = struct {
     model: []const u8,
+    provider_endpoint: ?[]const u8 = null,
     provider: model_provider.ProviderId = .gateway,
     update_channel: []const u8 = "stable",
     build_channel: []const u8 = "stable",
@@ -489,8 +495,9 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("[status] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[status] model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("[status] model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
+        if (self.provider_endpoint) |endpoint| try out.writer.print("[status] provider_endpoint={s}\n", .{endpoint});
         try out.writer.print("[status] update_channel={s}\n", .{self.update_channel});
         try out.writer.print("[status] build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
@@ -516,7 +523,7 @@ pub const StatusSnapshot = struct {
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
             try out.writer.writeAll("[status] connected_providers=");
-            try writeConnectedProvidersText(&out.writer, self.auth);
+            try self.writeConnections(&out.writer);
             try out.writer.writeByte('\n');
         }
         try out.writer.print("[status] auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -527,7 +534,7 @@ pub const StatusSnapshot = struct {
         if (self.auth.team) |team| {
             try out.writer.print("[status] team={s}\n", .{team});
         }
-        try out.writer.print("[status] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("[status] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -542,8 +549,9 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
+        if (self.provider_endpoint) |endpoint| try out.writer.print("provider_endpoint={s}\n", .{endpoint});
         try out.writer.print("update_channel={s}\n", .{self.update_channel});
         try out.writer.print("build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
@@ -552,14 +560,14 @@ pub const StatusSnapshot = struct {
         try out.writer.print("auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
             try out.writer.writeAll("connected_providers=");
-            try writeConnectedProvidersText(&out.writer, self.auth);
+            try self.writeConnections(&out.writer);
             try out.writer.writeByte('\n');
         }
         try out.writer.print("auth_refreshable={}\n", .{self.auth.refreshable()});
         if (self.auth.expired) try out.writer.writeAll("auth_expired=true\n");
         if (self.auth_help) |help| try out.writer.print("auth_help={s}\n", .{help});
         if (self.auth.team) |team| try out.writer.print("team={s}\n", .{team});
-        try out.writer.print("permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("workspace={s}\n", .{self.workspace_root});
         try out.writer.print("history_turns={d}\n", .{self.history_turns});
         try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -575,12 +583,25 @@ pub const StatusSnapshot = struct {
         return try out.toOwnedSlice();
     }
 
+    fn writeConnections(self: StatusSnapshot, writer: *std.Io.Writer) !void {
+        if (self.provider == .configured and self.auth.active_source == .configured) {
+            try writer.writeAll(self.provider.label());
+            if (!gatewayProviderConnected(self.auth) and !chatGptProviderConnected(self.auth) and !grokProviderConnected(self.auth)) return;
+            try writer.writeAll(", ");
+        }
+        try writeConnectedProvidersText(writer, self.auth);
+    }
+
     pub fn writeJson(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"kind\":\"status\",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
+        }
+        if (self.provider_endpoint) |endpoint| {
+            try writer.writeAll(",\"provider_endpoint\":");
+            try std.json.Stringify.value(endpoint, .{}, writer);
         }
         try writer.writeAll(",\"update_channel\":");
         try std.json.Stringify.value(self.update_channel, .{}, writer);
@@ -611,7 +632,12 @@ pub const StatusSnapshot = struct {
         if (self.provider != .gateway) {
             try writer.writeAll(",\"connected_providers\":[");
             var wrote_provider = false;
+            if (self.provider == .configured and self.auth.active_source == .configured) {
+                try std.json.Stringify.value(self.provider.label(), .{}, writer);
+                wrote_provider = true;
+            }
             if (gatewayProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("vercel-ai-gateway", .{}, writer);
                 wrote_provider = true;
             }
@@ -669,7 +695,7 @@ pub const PermissionsSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.print("[permissions] mode={s}\n", .{permissionModeLabel(self.mode)});
+        try out.writer.print("[permissions] mode={s}\n", .{permissions.permissionModeDisplayLabel(self.mode)});
         try writePermissionRulesText(&out.writer, self.rules);
         if (self.grants.len == 0) {
             try out.writer.writeAll("[permissions] session grants: (none)\n");
@@ -690,7 +716,7 @@ pub const PermissionsSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.print("mode={s}\n", .{permissionModeLabel(self.mode)});
+        try out.writer.print("mode={s}\n", .{permissions.permissionModeDisplayLabel(self.mode)});
         if (self.rules.rules.len == 0) {
             try out.writer.writeAll("configured rules: (none)\n");
         } else {
@@ -777,7 +803,7 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
             if (self.provider != .gateway) {
-                try out.writer.print(" - {s} · {s}\n", .{ id, provider_catalog.label(self.provider) });
+                try out.writer.print(" - {s} · {s}\n", .{ id, providerDisplayName(&self.provider) });
             } else {
                 try out.writer.print(" - {s}\n", .{id});
             }
@@ -805,7 +831,7 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
             if (self.provider != .gateway) {
-                try out.writer.print("\n - {s} · {s}", .{ id, provider_catalog.label(self.provider) });
+                try out.writer.print("\n - {s} · {s}", .{ id, providerDisplayName(&self.provider) });
             } else {
                 try out.writer.print("\n - {s}", .{id});
             }
@@ -835,7 +861,7 @@ pub const ModelListSnapshot = struct {
                 try out.writer.writeAll("{\"id\":");
                 try std.json.Stringify.value(id, .{}, &out.writer);
                 try out.writer.writeAll(",\"source\":");
-                try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, &out.writer);
+                try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, &out.writer);
                 try out.writer.writeByte('}');
             }
         }
@@ -852,16 +878,19 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .configured => "configured provider",
         };
     }
 
     fn catalogExplanation(self: ModelListSnapshot) ?[]const u8 {
+        if (self.provider == .configured) return "Models from profile settings; explicit model IDs do not require catalog discovery.";
         if (!self.private_models_hidden) return null;
         const reason = self.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {
             .no_credential => "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
             .fx_login_team_required => "Choose a Vercel team to load its private models.",
             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
+            .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
@@ -1233,13 +1262,15 @@ pub const SessionRecoverySnapshot = struct {
         self: SessionRecoverySnapshot,
         alloc: Allocator,
     ) ![]u8 {
+        const usage_warning = if (self.result.usage_incomplete) "warning: historical usage is incomplete because the source accounting data is corrupt\n" else "";
         if (self.result.status == .indeterminate) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
+                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\n{s}resolve: fx --resume {s}\ninspect: fx doctor\n",
                 .{
                     self.result.recovered_session_id,
                     self.result.source_session_id,
+                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
@@ -1247,22 +1278,24 @@ pub const SessionRecoverySnapshot = struct {
         if (self.result.status == .recovered_with_unverified_artifacts) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
+                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\n{s}resume: fx --resume {s}\n",
                 .{
                     self.result.source_session_id,
                     self.result.recovered_session_id,
                     self.result.history_len,
+                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
         }
         return std.fmt.allocPrint(
             alloc,
-            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: fx --resume {s}\n",
+            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\n{s}resume: fx --resume {s}\n",
             .{
                 self.result.source_session_id,
                 self.result.recovered_session_id,
                 self.result.history_len,
+                usage_warning,
                 self.result.recovered_session_id,
             },
         );
@@ -1295,9 +1328,11 @@ pub const SessionRecoverySnapshot = struct {
             &out.writer,
         );
         try out.writer.print(
-            ",\"history_turns\":{d}}}",
+            ",\"history_turns\":{d}",
             .{self.result.history_len},
         );
+        if (self.result.usage_incomplete) try out.writer.writeAll(",\"usage_incomplete\":true");
+        try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
 };
@@ -1331,7 +1366,7 @@ pub const DoctorSnapshot = struct {
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[doctor] model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("[doctor] model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
         try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
         try out.writer.print("[doctor] auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -1339,7 +1374,7 @@ pub const DoctorSnapshot = struct {
         if (self.auth.team) |team| {
             try out.writer.print("[doctor] team={s}\n", .{team});
         }
-        try out.writer.print("[doctor] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("[doctor] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[doctor] agent_step_limit={d}\n", .{self.agent_step_limit});
         if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "doctor");
 
@@ -1374,7 +1409,7 @@ pub const DoctorSnapshot = struct {
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
@@ -1405,147 +1440,6 @@ pub const DoctorSnapshot = struct {
             try mcp.writeJson(writer);
         }
         try writer.writeByte('}');
-    }
-};
-
-pub const BackgroundListSnapshot = struct {
-    records: []const background_store.Record,
-
-    pub fn render(self: BackgroundListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
-        if (self.records.len == 0) {
-            return std.fmt.allocPrint(alloc, "[background] no persisted background records\n", .{});
-        }
-
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("[background] {d} saved\n", .{self.records.len});
-        for (self.records) |entry| {
-            try out.writer.print(" - #{d} [{s}] {s}\n", .{ entry.id, @tagName(entry.state), entry.command });
-            try out.writer.print("   cwd: {s}\n", .{entry.cwd});
-            try out.writer.print("   log: {s}\n", .{entry.log_path});
-            if (entry.server_url) |url| {
-                try out.writer.print("   url: {s}\n", .{url});
-            }
-            if (entry.diagnostic) |diagnostic| {
-                try out.writer.print("   diagnostic: {s}\n", .{diagnostic});
-            }
-        }
-
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("{{\"kind\":\"background\",\"count\":{d},\"records\":[", .{self.records.len});
-        for (self.records, 0..) |entry, i| {
-            if (i > 0) try out.writer.writeByte(',');
-            try out.writer.print("{{\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ entry.id, entry.started_at_ms, entry.updated_at_ms });
-            try out.writer.writeAll(",\"pid\":");
-            try std.json.Stringify.value(entry.pid, .{}, &out.writer);
-            try out.writer.writeAll(",\"command\":");
-            try std.json.Stringify.value(entry.command, .{}, &out.writer);
-            try out.writer.writeAll(",\"cwd\":");
-            try std.json.Stringify.value(entry.cwd, .{}, &out.writer);
-            try out.writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, &out.writer);
-            try out.writer.writeAll(",\"state\":");
-            try std.json.Stringify.value(@tagName(entry.state), .{}, &out.writer);
-            try out.writer.writeAll(",\"server_url\":");
-            if (entry.server_url) |url| {
-                try std.json.Stringify.value(url, .{}, &out.writer);
-            } else {
-                try out.writer.writeAll("null");
-            }
-            try out.writer.writeAll(",\"diagnostic\":");
-            if (entry.diagnostic) |diagnostic| {
-                try std.json.Stringify.value(diagnostic, .{}, &out.writer);
-            } else {
-                try out.writer.writeAll("null");
-            }
-            try out.writer.writeAll("}");
-        }
-        try out.writer.writeAll("]}");
-        return try out.toOwnedSlice();
-    }
-};
-
-pub const BackgroundDetailSnapshot = struct {
-    record: background_store.Record,
-
-    pub fn render(self: BackgroundDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("[background] #{d} [{s}] {s}\n", .{ self.record.id, @tagName(self.record.state), self.record.command });
-        try out.writer.print("pid: {s}\n", .{self.record.pid});
-        try out.writer.print("cwd: {s}\n", .{self.record.cwd});
-        try out.writer.print("log: {s}\n", .{self.record.log_path});
-        try out.writer.print("started_at_ms: {d}\n", .{self.record.started_at_ms});
-        try out.writer.print("updated_at_ms: {d}\n", .{self.record.updated_at_ms});
-        try out.writer.print("expect_url: {s}\n", .{if (self.record.expect_url) "true" else "false"});
-        try out.writer.print("server_url: {s}\n", .{self.record.server_url orelse "(none)"});
-        try out.writer.print("diagnostic: {s}\n", .{self.record.diagnostic orelse "(none)"});
-        if (self.record.exit_code) |code| {
-            try out.writer.print("exit_code: {d}\n", .{code});
-        } else {
-            try out.writer.writeAll("exit_code: (none)\n");
-        }
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("{{\"kind\":\"background_detail\",\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ self.record.id, self.record.started_at_ms, self.record.updated_at_ms });
-        try out.writer.writeAll(",\"pid\":");
-        try std.json.Stringify.value(self.record.pid, .{}, &out.writer);
-        try out.writer.writeAll(",\"command\":");
-        try std.json.Stringify.value(self.record.command, .{}, &out.writer);
-        try out.writer.writeAll(",\"cwd\":");
-        try std.json.Stringify.value(self.record.cwd, .{}, &out.writer);
-        try out.writer.writeAll(",\"log_path\":");
-        try std.json.Stringify.value(self.record.log_path, .{}, &out.writer);
-        try out.writer.writeAll(",\"state\":");
-        try std.json.Stringify.value(@tagName(self.record.state), .{}, &out.writer);
-        try out.writer.print(",\"expect_url\":{s}", .{if (self.record.expect_url) "true" else "false"});
-        try out.writer.writeAll(",\"server_url\":");
-        if (self.record.server_url) |url| {
-            try std.json.Stringify.value(url, .{}, &out.writer);
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"diagnostic\":");
-        if (self.record.diagnostic) |diagnostic| {
-            try std.json.Stringify.value(diagnostic, .{}, &out.writer);
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"exit_code\":");
-        if (self.record.exit_code) |code| {
-            try out.writer.print("{d}", .{code});
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeByte('}');
-        return try out.toOwnedSlice();
     }
 };
 
@@ -1713,6 +1607,18 @@ pub const UpgradeSnapshot = struct {
                     try writeVersionWithPrefix(&out.writer, self.latest);
                 }
                 try out.writer.writeByte('\n');
+                const channel = update_target.Channel.parse(self.channel) orelse .stable;
+                if (update_notes.destination(
+                    channel,
+                    self.latest,
+                    self.current_revision,
+                    self.latest_revision,
+                )) |notes| {
+                    try update_notes.writeLabel(notes.kind, &out.writer);
+                    try out.writer.writeAll(": ");
+                    try notes.writeUrl(&out.writer);
+                    try out.writer.writeByte('\n');
+                }
             },
             .up_to_date => {
                 if (std.mem.eql(u8, self.channel, "dev") and self.latest_revision.len > 0) {
@@ -1854,23 +1760,6 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writer.writeAll("[assistant]\n");
             try writeTextBlock(writer, entry.assistant);
         },
-        .background_command => |entry| {
-            try writeSessionUserTurnText(writer, entry.user);
-            try writeSessionExecutionText(writer, entry.execution);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll("[assistant]\n");
-                try writeTextBlock(writer, assistant);
-            }
-            try writer.writeAll("[background]\n");
-            try writer.print("log: {s}\n", .{entry.log_path});
-            try writer.print("expect_url: {s}\n", .{if (entry.expect_url) "true" else "false"});
-            try writer.print("url: {s}\n", .{entry.url orelse "(none)"});
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll("record_id: ");
-                try writeHexBytes(writer, &record_id);
-                try writer.writeByte('\n');
-            }
-        },
         .interrupted => |entry| {
             try writeSessionUserTurnText(writer, entry.user);
             try writeSessionExecutionText(writer, entry.execution);
@@ -1966,33 +1855,6 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try session_json.writeExecutionMemoryJson(writer, entry.execution);
             try writer.writeByte('}');
         },
-        .background_command => |entry| {
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeSessionUserTurnJson(writer, entry.user);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll(",\"assistant\":");
-                try std.json.Stringify.value(assistant, .{}, writer);
-            }
-            if (!entry.execution.isEmpty()) {
-                try writer.writeAll(",\"execution\":");
-                try session_json.writeExecutionMemoryJson(writer, entry.execution);
-            }
-            try writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, writer);
-            try writer.print(",\"expect_url\":{s}", .{if (entry.expect_url) "true" else "false"});
-            try writer.writeAll(",\"url\":");
-            if (entry.url) |url| {
-                try std.json.Stringify.value(url, .{}, writer);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll(",\"background_record_id\":\"");
-                try writeHexBytes(writer, &record_id);
-                try writer.writeByte('"');
-            }
-            try writer.writeByte('}');
-        },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
             try writeSessionUserTurnJson(writer, entry.user);
@@ -2026,14 +1888,6 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             }
             try writer.writeByte('}');
         },
-    }
-}
-
-fn writeHexBytes(writer: *std.Io.Writer, bytes: []const u8) !void {
-    const alphabet = "0123456789abcdef";
-    for (bytes) |byte| {
-        try writer.writeByte(alphabet[byte >> 4]);
-        try writer.writeByte(alphabet[byte & 0x0f]);
     }
 }
 
@@ -2649,10 +2503,6 @@ test "core session detail snapshot preserves history variant shapes" {
         .action = .read,
         .status = .success,
     }};
-    const record_id = types.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
     const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("summary"),
@@ -2663,14 +2513,10 @@ test "core session detail snapshot preserves history variant shapes" {
             .user = .{ .text = @constCast("hola"), .images = @constCast(&images) },
             .assistant = @constCast("que tal"),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("npm run dev") },
-            .assistant = @constCast("The server is starting."),
+            .assistant = @constCast("The historical command is no longer owned."),
             .execution = .{ .files = files[0..] },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
-            .background_record_id = record_id,
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("inspect") },
@@ -2710,20 +2556,18 @@ test "core session detail snapshot preserves history variant shapes" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "[compacted] removed_turns=3 compactions=1") != null);
     try std.testing.expect(std.mem.find(u8, text, "[user]\nhola\n[images] 1\n - /tmp/a.png (image/png)\n[assistant]\nque tal\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe server is starting.\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[background]\nlog: /tmp/server.log\nexpect_url: true\nurl: http://localhost:3000\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "record_id: 00112233445566778899aabbccddeeff") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe historical command is no longer owned.\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[background]") == null);
     try std.testing.expect(std.mem.find(u8, text, "[assistant]\nI inspected the entry point.\n[interrupted]") != null);
 
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"compacted_summary\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"assistant\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") == null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"interrupted\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "{\"path\":\"/tmp/a.png\",\"media_type\":\"image/png\"}") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The server is starting.\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"background_record_id\":\"00112233445566778899aabbccddeeff\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The historical command is no longer owned.\"") != null);
     try std.testing.expect(std.mem.count(u8, json, "\"execution\"") >= 2);
 }
 
@@ -2795,7 +2639,7 @@ test "core session detail JSON includes assistant execution memory" {
 
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":3") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"turn_summary\"") == null);
     try std.testing.expect(std.mem.find(u8, json, "\"name\":\"web_fetch\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "artifact-file.pdf") != null);
@@ -2830,6 +2674,24 @@ test "core session migration snapshot text and json stay stable" {
         "{\"kind\":\"session_migration\",\"id\":\"session.v3\",\"status\":\"migrated\",\"source_schema_version\":2,\"source_bytes\":4096}",
         json,
     );
+}
+
+test "core session recovery keeps incomplete accounting visible for every result" {
+    inline for (.{ .recovered, .recovered_with_unverified_artifacts, .indeterminate }) |status| {
+        const snapshot: SessionRecoverySnapshot = .{ .result = .{
+            .source_session_id = @constCast("source"),
+            .recovered_session_id = @constCast("copy"),
+            .history_len = 1,
+            .usage_incomplete = true,
+            .status = status,
+        } };
+        const text = try snapshot.renderText(std.testing.allocator);
+        defer std.testing.allocator.free(text);
+        try std.testing.expect(std.mem.find(u8, text, "historical usage is incomplete") != null);
+        const json = try snapshot.renderJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"usage_incomplete\":true") != null);
+    }
 }
 
 test "core session recovery snapshot text and json stay stable" {
@@ -2957,48 +2819,6 @@ test "doctor text escapes hostile check details while json preserves data" {
     ) != null);
 }
 
-test "background output contracts import background store" {
-    try std.testing.expect(background_store.Record == @import("../background/background_store.zig").Record);
-    try std.testing.expect(background_store.TaskState == @import("../background/background_store.zig").TaskState);
-}
-
-test "core background list and detail snapshots preserve persisted fields" {
-    const records = [_]background_store.Record{
-        .{
-            .id = 7,
-            .pid = @constCast("100"),
-            .command = @constCast("npm run dev"),
-            .cwd = @constCast("/tmp/fx"),
-            .log_path = @constCast("/tmp/fx.log"),
-            .expect_url = false,
-            .server_url = @constCast("http://localhost:3000"),
-            .started_at_ms = 1,
-            .updated_at_ms = 2,
-            .state = .running,
-        },
-    };
-
-    const list_json = try (BackgroundListSnapshot{ .records = &records }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(list_json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"background\",\"count\":1,\"records\":[{\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/fx\",\"log_path\":\"/tmp/fx.log\",\"state\":\"running\",\"server_url\":\"http://localhost:3000\",\"diagnostic\":null}]}",
-        list_json,
-    );
-
-    const detail_text = try (BackgroundDetailSnapshot{ .record = records[0] }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(detail_text);
-    try std.testing.expect(std.mem.find(u8, detail_text, "expect_url: false\n") != null);
-    try std.testing.expect(std.mem.find(u8, detail_text, "server_url: http://localhost:3000\n") != null);
-    try std.testing.expect(std.mem.find(u8, detail_text, "exit_code: (none)\n") != null);
-
-    const detail_json = try (BackgroundDetailSnapshot{ .record = records[0] }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(detail_json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"background_detail\",\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/fx\",\"log_path\":\"/tmp/fx.log\",\"state\":\"running\",\"expect_url\":false,\"server_url\":\"http://localhost:3000\",\"diagnostic\":null,\"exit_code\":null}",
-        detail_json,
-    );
-}
-
 test "core credits snapshot renders error output" {
     const snapshot = CreditsSnapshot{ .err_message = "gateway unavailable" };
 
@@ -3074,7 +2894,11 @@ test "core upgrade snapshot renders errors and statuses" {
         .status = .upgraded,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(upgraded_text);
-    try std.testing.expectEqualStrings("upgraded to v0.2.10\n", upgraded_text);
+    try std.testing.expectEqualStrings(
+        "upgraded to v0.2.10\n" ++
+            "notes: https://fx.sh/changelog#v0.2.10\n",
+        upgraded_text,
+    );
 
     const upgraded_json = try (UpgradeSnapshot{
         .current = "0.2.9",
@@ -3094,7 +2918,11 @@ test "core upgrade snapshot renders errors and statuses" {
         .status = .upgraded,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(prefixed_text);
-    try std.testing.expectEqualStrings("upgraded to v0.2.10\n", prefixed_text);
+    try std.testing.expectEqualStrings(
+        "upgraded to v0.2.10\n" ++
+            "notes: https://fx.sh/changelog#v0.2.10\n",
+        prefixed_text,
+    );
 
     const up_to_date = UpgradeSnapshot{
         .current = "0.2.9",
@@ -3135,7 +2963,11 @@ test "core upgrade snapshot identifies dev revisions" {
 
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("upgraded to dev abcdef012345 (v0.3.66)\n", text);
+    try std.testing.expectEqualStrings(
+        "upgraded to dev abcdef012345 (v0.3.66)\n" ++
+            "changes: https://github.com/vercel-labs/fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
+        text,
+    );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);

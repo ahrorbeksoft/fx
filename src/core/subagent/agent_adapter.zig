@@ -1,8 +1,11 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
+const skill_invocation = @import("../skills/skill_invocation.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -29,7 +32,6 @@ const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
-const parent_delivery_projector = @import("parent_delivery_projector.zig");
 const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
@@ -46,8 +48,7 @@ pub const Config = struct {
     provider_set: provider_set.Set,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
-    skills_prompt_section: []const u8 = "",
-    explicit_skills_prompt_section: []const u8 = "",
+    skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
@@ -66,6 +67,7 @@ const Context = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     turn_outcome: ?types.TurnPresentationOutcome = null,
+    refreshed_credential: ?credentials.Credential = null,
 
     fn toolContext(self: *Context) tool_runtime.Context {
         var result = self.config.tool_context;
@@ -92,8 +94,6 @@ const Context = struct {
         result.interactive = false;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
-        result.background_url_ctx = self;
-        result.on_background_url_ready = discardBackgroundUrl;
         result.web_search_progress_ctx = null;
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
@@ -145,27 +145,23 @@ pub fn run(
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
     routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
     routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
-    if (!model_provider.authorizesCredential(
+    if (admission.provider == .configured or !model_provider.authorizesCredential(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        const resolution = credentials.resolveForProvider(
+        routed_credential = auth_runtime.prepareCredential(
             turn.alloc,
             config.tool_context.oauth_transport,
             config.tool_context.secret_store,
-            .refresh_if_needed,
             admission.provider,
             config.tool_context.credential_source,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
-                return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err));
             return error.ProviderFailed;
         };
-        routed_credential = resolution.credential;
         const credential = if (routed_credential) |*value| value else {
-            turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
-                return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_missing", admission.model);
             return error.ProviderFailed;
         };
         routed_config.tool_context.api_key = credential.token;
@@ -176,6 +172,16 @@ pub fn run(
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
+    debug_trace.logf(
+        "subagent",
+        "child turn routed child_id={s} provider={s} model={s} effort={s}",
+        .{
+            turn.child_id orelse "unknown",
+            @tagName(admission.provider),
+            admission.model,
+            admission.effort.label(),
+        },
+    );
     if (!routed_config.tool_context.provider_capabilities.fx_search) {
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
@@ -184,6 +190,10 @@ pub fn run(
         .turn_id = debug_trace.nextTurnId(),
         .subagent_id = debug_trace.nextSubagentId(),
     };
+    if (!turn.workerRuntime().beginDirectProcessing(trace_context.turn_id)) {
+        return error.ProviderFailed;
+    }
+    defer turn.workerRuntime().finishProcessing();
     var context = Context{
         .config = routed_config,
         .turn = turn,
@@ -191,9 +201,13 @@ pub fn run(
         .cancel = cancel,
         .subagent_id = trace_context.subagent_id,
     };
+    defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
+        return error.ProviderFailed;
+    };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
-    const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
-        return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
@@ -212,6 +226,7 @@ pub fn run(
             null,
         .permission_mode = admission.permission_mode,
         .history = history,
+        .unversioned_history_count = turn.sessionRuntime().unversionedHistoryEnd(),
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
         else
@@ -226,6 +241,22 @@ pub fn run(
         .recovery_checkpoint = recovery_checkpoint,
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
+    const child_tool_names = try withoutSubagentNames(
+        arena,
+        config.advertised_tool_names,
+    );
+    const child_functions = try withoutSubagentFunctions(
+        arena,
+        config.advertised_functions,
+    );
+    const child_system_prompt = if (message.system_prompt_overlay.len == 0)
+        config.system_prompt
+    else
+        std.fmt.allocPrint(
+            arena,
+            "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
+            .{ config.system_prompt, message.system_prompt_overlay },
+        ) catch return error.OutOfMemory;
     debug_trace.eventf(
         "subagent",
         "trace_identity",
@@ -238,7 +269,8 @@ pub fn run(
         },
     );
     const deps = runtimeDeps(&context);
-    execution.runNormalAgentTurn(
+    agent_runtime.processAgentPrompt(
+        &turn.sessionRuntime().agent,
         &deps,
         null,
         .{
@@ -252,14 +284,13 @@ pub fn run(
             .outcome_allocator = turn.alloc,
         },
         .{
-            .system_prompt = config.system_prompt,
+            .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
-            .skills_prompt_section = config.skills_prompt_section,
-            .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
+            .skill_catalog = config.skill_catalog,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
-            .advertised_tool_names = config.advertised_tool_names,
-            .advertised_functions = config.advertised_functions,
+            .advertised_tool_names = child_tool_names,
+            .advertised_functions = child_functions,
             .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
@@ -285,13 +316,71 @@ pub fn run(
             error.Cancelled => error.Cancelled,
             else => error.ProviderFailed,
         };
-        if (mapped != error.OutOfMemory) {
-            turn.setFailureDiagnostic("agent_turn_failed", @errorName(err)) catch
-                return error.OutOfMemory;
-        }
+        turn.setFailureDiagnostic("agent_turn_failed", @errorName(err));
+        debug_trace.eventf("subagent", "child_execution_failed", trace_context, "child_id={s} err={s}", .{ turn.child_id orelse "unknown", @errorName(err) });
         return mapped;
     };
-    return if (context.turn_outcome == .paused) .paused else .completed;
+    return finalRunOutcome(context.turn_outcome);
+}
+
+fn finalRunOutcome(outcome: ?types.TurnPresentationOutcome) error{ProviderFailed}!execution.RunOutcome {
+    return switch (outcome orelse return error.ProviderFailed) {
+        .completed => .completed,
+        .failed => error.ProviderFailed,
+        .interrupted, .paused => .paused,
+    };
+}
+
+test "subagent finalization preserves every outcome and fails closed on absence" {
+    const cases = [_]struct {
+        outcome: ?types.TurnPresentationOutcome,
+        expected: error{ProviderFailed}!execution.RunOutcome,
+    }{
+        .{ .outcome = .completed, .expected = .completed },
+        .{ .outcome = .failed, .expected = error.ProviderFailed },
+        .{ .outcome = .interrupted, .expected = .paused },
+        .{ .outcome = .paused, .expected = .paused },
+        .{ .outcome = null, .expected = error.ProviderFailed },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, finalRunOutcome(case.outcome));
+    }
+}
+
+fn withoutSubagentNames(
+    alloc: Allocator,
+    names: []const []const u8,
+) ![]const []const u8 {
+    var count: usize = 0;
+    for (names) |name| {
+        if (!std.mem.eql(u8, name, "subagent")) count += 1;
+    }
+    const filtered = try alloc.alloc([]const u8, count);
+    var index: usize = 0;
+    for (names) |name| {
+        if (std.mem.eql(u8, name, "subagent")) continue;
+        filtered[index] = name;
+        index += 1;
+    }
+    return filtered;
+}
+
+fn withoutSubagentFunctions(
+    alloc: Allocator,
+    functions: []const model_tool_schema.FunctionSchema,
+) ![]const model_tool_schema.FunctionSchema {
+    var count: usize = 0;
+    for (functions) |function| {
+        if (!std.mem.eql(u8, function.name, "subagent")) count += 1;
+    }
+    const filtered = try alloc.alloc(model_tool_schema.FunctionSchema, count);
+    var index: usize = 0;
+    for (functions) |function| {
+        if (std.mem.eql(u8, function.name, "subagent")) continue;
+        filtered[index] = function;
+        index += 1;
+    }
+    return filtered;
 }
 
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
@@ -301,15 +390,18 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
+        .available_model_capabilities = availableModelCapabilities,
+        .resolve_model_capabilities = resolveModelCapabilities,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = takeChildSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
-        .prepare_parent_turn_context = prepareParentTurnContext,
-        .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .snapshot_mcp_definition = snapshotMcpDefinition,
+        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
@@ -321,8 +413,10 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = .{
             .set = setRecoveryCheckpoint,
+            .clear = clearRecoveryCheckpoint,
         },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
@@ -341,6 +435,139 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     };
 }
 
+fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const provider = context.config.provider_set.select(context.admission.provider);
+    if (provider.model_catalog) |catalog| {
+        if (catalog.lookupCapabilities(model)) |capabilities| return capabilities;
+    }
+    return model_capabilities.capabilitiesForModel(model);
+}
+
+fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.cancel.load(.seq_cst)) return error.Cancelled;
+    return availableModelCapabilities(raw, model);
+}
+
+test "child runtime capability callbacks preserve fallback and child cancellation" {
+    const session_store = @import("../session/session_store.zig");
+    const catalog = @import("../gateway/model_catalog.zig");
+    const authority = @import("authority.zig");
+    const Fixture = struct {
+        fetches: usize = 0,
+        lookups: usize = 0,
+
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+        }
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fetches += 1;
+            return .{ .failure = .{ .category = .runtime } };
+        }
+        fn lookup(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.lookups += 1;
+            return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
+        }
+        fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var store = try session_store.Store.initFromHome(alloc, root, root);
+    defer store.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, .{
+        .id = @constCast("capability-parent"),
+        .origin_workspace_root = @constCast(root),
+        .workspace_root = @constCast(root),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
+    });
+    defer writable.deinit(alloc);
+    const host = try tool_host.Runtime.create(alloc, &store, "capability-parent", .{ .resolve_fn = Fixture.resolve }, .{});
+    defer host.deinit();
+    var turn = try execution.TurnContext.init(alloc, &writable, 0);
+    defer turn.deinit();
+    var admission = try domain.captureAdmission(alloc, .{ .parent_id = "capability-parent", .source_id = "capability-parent", .model = "parent-model", .effort = .auto });
+    defer admission.deinit(alloc);
+    var fixture: Fixture = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var parent_cancel = std.atomic.Value(bool).init(false);
+    const registry = context_contract.Registry{ .default_provider = context_contract.empty_provider };
+    var context = Context{
+        .config = .{
+            .host = host,
+            .tool_context = .{
+                .workspace_root = root,
+                .ignored_list_entries = &.{},
+                .max_list_entries = 100,
+                .max_read_file_bytes = 65536,
+                .max_read_file_lines = 400,
+                .max_read_file_line_len = 2000,
+                .max_command_output_bytes = 65536,
+                .api_key = "",
+                .model = "parent-model",
+                .provider = .grok,
+                .gateway_retry_count = 1,
+                .gateway_chat_url = "",
+                .agent_step_limit = 8,
+                .permission_mode = .ask,
+                .permission_grants = &.{},
+                .permission_rules = .{},
+                .worker = turn.workerRuntime(),
+                .session = turn.sessionRuntime(),
+                .context_registry = registry,
+                .output_chunk_ctx = &fixture,
+                .on_output_chunk = Fixture.output,
+                .cancel_flag = &parent_cancel,
+            },
+            .provider_set = .{ .gateway = .{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } }, .codex = .{}, .grok = .{} },
+            .system_prompt = "",
+            .context_registry = registry,
+            .context_enabled = false,
+        },
+        .turn = &turn,
+        .admission = admission,
+        .cancel = &cancel,
+        .subagent_id = 1,
+    };
+    const deps = runtimeDeps(&context);
+    const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
+    try std.testing.expectEqualDeep(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
+    try std.testing.expectEqualDeep(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
+    context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
+    const available = deps.available_model_capabilities(deps.ctx, "child-model");
+    try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
+    try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
+    try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    const lookups = fixture.lookups;
+    cancel.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try std.testing.expectEqual(lookups, fixture.lookups);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+}
+
+fn takeChildSteeringBoundary(
+    raw: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.cancel.load(.seq_cst)) return if (kind == .cancelled) .interrupt else .none;
+    return context.turn.workerRuntime().takeSteeringBoundaryInto(context.turn.alloc, arena, turn_id, kind);
+}
+
 fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.release_agent_terminal_lease(context.toolContext(), session_id);
@@ -354,13 +581,50 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
-    return auth_runtime.refreshCredentialTokenForAccount(
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
+    var refreshed = (try auth_runtime.refreshCredentialForAccount(
         context.config.tool_context.oauth_transport,
-        alloc,
+        context.turn.alloc,
         source,
         mode,
         expected_account_id,
-    );
+    )) orelse return null;
+    defer refreshed.deinit(context.turn.alloc);
+    if (context.config.tool_context.credential_source != refreshed.source or
+        !optionalCredentialFieldEqual(
+            context.config.tool_context.account_id,
+            refreshed.accountId(),
+        ) or
+        !optionalCredentialFieldEqual(
+            context.config.tool_context.gateway_team,
+            refreshed.gatewayTeam(),
+        ))
+    {
+        return error.CredentialAuthorityChanged;
+    }
+
+    const worker_token = try alloc.dupe(u8, refreshed.token);
+    errdefer secret.zeroAndFree(alloc, worker_token);
+    if (context.refreshed_credential) |*current| current.deinit(context.turn.alloc);
+    context.refreshed_credential = refreshed;
+    refreshed.token = &.{};
+    refreshed.account_id = null;
+    refreshed.team_id = null;
+    refreshed.team_slug = null;
+    const current = &context.refreshed_credential.?;
+    context.config.tool_context.api_key = current.token;
+    context.config.tool_context.credential_source = current.source;
+    context.config.tool_context.account_id = current.accountId();
+    context.config.tool_context.gateway_team = current.gatewayTeam();
+    return worker_token;
+}
+
+fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn finalizeTurn(
@@ -373,38 +637,6 @@ fn finalizeTurn(
     context.turn_outcome = outcome;
 }
 
-fn prepareParentTurnContext(
-    raw: *anyopaque,
-    arena: Allocator,
-) !?agent_runtime.PreparedParentTurnContext {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const child_id = context.turn.child_id orelse return null;
-    return parent_delivery_projector.prepare(
-        arena,
-        context.config.host.sessions,
-        child_id,
-        context.config.host.manager.options.child_store,
-    );
-}
-
-fn acknowledgeParentTurnContext(
-    raw: *anyopaque,
-    arena: Allocator,
-    acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
-) void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const retirement_ready = parent_delivery_projector
-        .acknowledgeWithRetirementSignal(
-        arena,
-        context.config.host.sessions,
-        context.config.host.manager.options.child_store,
-        acknowledgements,
-    );
-    if (retirement_ready) {
-        context.config.host.requestRetirementSweep(io_mod.milliTimestamp());
-    }
-}
-
 fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     const tool_ctx = context.toolContext();
@@ -413,16 +645,13 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .access_scope = tool_ctx.access_scope,
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
-        .tracker = null,
-        .background = tool_ctx.background,
-        .session = context.turn.sessionRuntime(),
     }, arena, messages);
 }
 
-fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
+fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     try context.config.context_registry.appendDefaultStatic(.{
-        .project_context = context.config.project_context,
+        .project_context = project_context orelse context.config.project_context,
     }, arena, messages);
     var snapshot = try snapshotModelCatalogForView(
         arena,
@@ -515,6 +744,11 @@ test "subagent inherits model capabilities" {
     try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
 }
 
+fn snapshotMcpDefinition(raw: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.snapshotMcpDefinition(context.toolContext(), arena, name, known);
+}
+
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.validateToolCall(context.toolContext(), arena, call);
@@ -523,6 +757,11 @@ fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !ag
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
+}
+
+fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
 }
 
 fn admissionContext(
@@ -546,9 +785,11 @@ fn requestToolPermission(
     live: ?agent_runtime.LiveToolAuthority,
     revalidation: ?agent_runtime.LivePermissionRevalidation,
     dynamic_names: []const []const u8,
+    mcp_review_schema_json: ?[]const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
+    var tool_ctx = admissionContext(context, dynamic_names, review);
+    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     if (revalidation) |request| return switch (request) {
         .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
             tool_ctx.admissionInputWithLiveAuthority(live),
@@ -609,6 +850,7 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
         context.config.tool_context.tool_registry,
         context.config.tool_context.workspace_root,
         context.config.tool_context.terminal_client,
+        context.config.tool_context.managed_executions,
         call,
     );
 }
@@ -648,6 +890,16 @@ fn propagateHistoryTurn(raw: *anyopaque, turn: types.HistoryTurn) !void {
     );
 }
 
+fn commitContextCompaction(
+    raw: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+    retained_from: ?types.ContextHistoryCut,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.commitContextCompaction(summary, active_prefix, retained_from, io_mod.milliTimestamp());
+}
+
 fn setRecoveryCheckpoint(
     raw: *anyopaque,
     checkpoint: session_codec.RecoveryCheckpoint,
@@ -656,10 +908,18 @@ fn setRecoveryCheckpoint(
     try context.turn.setRecoveryCheckpoint(checkpoint, io_mod.milliTimestamp());
 }
 
+fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.clearRecoveryCheckpoint(io_mod.milliTimestamp());
+}
+
 fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (usage.input_tokens) |value| context.input_tokens = value;
     if (usage.output_tokens) |value| context.output_tokens = value;
+    if (context.turn.live_metrics) |metrics| {
+        metrics.input_tokens.store(context.input_tokens, .monotonic);
+    }
 }
 
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {
@@ -674,8 +934,10 @@ fn discardGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 fn pushLiveText(raw: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     switch (emission) {
+        .assistant_started => {},
         .assistant_source => {},
         .assistant_rendered => |text| context.turn.appendLiveText(text),
+        .assistant_restarted => |text| context.turn.appendLiveText(text),
         .operational => |text| context.turn.appendLiveText(text),
     }
 }
@@ -732,9 +994,9 @@ fn captureHttpError(
         detail,
     );
     defer context.turn.alloc.free(formatted);
-    const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
-    defer context.turn.alloc.free(redacted);
-    try context.turn.setFailureDiagnostic("provider_http_error", redacted);
+    const masked = try execution_memory.maskTextForDisplay(context.turn.alloc, formatted);
+    defer context.turn.alloc.free(masked);
+    context.turn.setFailureDiagnostic("provider_http_error", masked);
 }
 
 fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
@@ -756,4 +1018,3 @@ fn pushLiveOutputChunk(
         .text = @constCast(text),
     } });
 }
-fn discardBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}

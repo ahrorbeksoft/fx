@@ -107,6 +107,7 @@ pub const UserSettingsPatch = struct {
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
+    session_titles: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -126,6 +127,7 @@ pub const UserSettingsPatch = struct {
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
+            self.session_titles == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
             self.notification_max == null;
@@ -220,6 +222,7 @@ const UserPreferenceField = enum(u4) {
     prompt_history_enabled,
     statusline_context,
     statusline_session,
+    session_titles,
 
     fn mask(self: UserPreferenceField) u16 {
         return @as(u16, 1) << @intFromEnum(self);
@@ -238,6 +241,7 @@ const UserPreferenceField = enum(u4) {
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
             .statusline_context => "settings.json.preference-migration.statusline_context.json",
             .statusline_session => "settings.json.preference-migration.statusline_session.json",
+            .session_titles => "settings.json.preference-migration.session_titles.json",
         };
     }
 };
@@ -254,6 +258,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .prompt_history_enabled,
     .statusline_context,
     .statusline_session,
+    .session_titles,
 };
 
 const SettingsMutation = union(enum) {
@@ -956,6 +961,31 @@ test "provider patch writes one bounded provider model collection" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
 }
 
+test "model and fast patch binds the fast preference atomically" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"models\":{\"gateway\":\"provider/old\"},\"fast_mode\":true}",
+        .{},
+    );
+    _ = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .model_preference = .{ .provider = .gateway, .model = "provider/fast-toggle" },
+        .fast_mode = true,
+    });
+    const binding = root.object.get("fast_mode_model_bound");
+    try std.testing.expect(binding != null);
+    try std.testing.expect(binding.?.bool);
+
+    _ = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .model_preference = .{ .provider = .gateway, .model = "provider/default" },
+    });
+    try std.testing.expect(!root.object.contains("fast_mode_model_bound"));
+}
+
 fn applyMutationToRoot(
     arena: Allocator,
     root: *std.json.Value,
@@ -985,7 +1015,7 @@ fn applyUserPatchToRoot(
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
-    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
+    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -995,10 +1025,17 @@ fn applyUserPatchToRoot(
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
+    if (patch.model_preference != null and patch.fast_mode != null) {
+        application.changed = try putBool(arena, &root.object, "fast_mode_model_bound", true) or application.changed;
+    } else if ((patch.model_preference != null or patch.fast_mode != null) and root.object.contains("fast_mode_model_bound")) {
+        _ = root.object.orderedRemove("fast_mode_model_bound");
+        application.changed = true;
+    }
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
+    if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
         var prompt_history = if (root.object.getPtr("prompt_history")) |value| blk: {
@@ -1115,6 +1152,12 @@ fn cleanupLegacyWorkspacePreferences(
             patch.fast_mode != null,
             application,
         );
+        if ((patch.model_preference != null or patch.fast_mode != null) and
+            entry.value_ptr.object.contains("fast_mode_model_bound"))
+        {
+            _ = entry.value_ptr.object.orderedRemove("fast_mode_model_bound");
+            application.legacy_fields_removed += 1;
+        }
         removeLegacyLeaf(
             &entry.value_ptr.object,
             "slash_menu_categories",
@@ -1141,6 +1184,13 @@ fn cleanupLegacyWorkspacePreferences(
             "startup_scrollback",
             .startup_scrollback,
             patch.startup_scrollback != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "session_titles",
+            .session_titles,
+            patch.session_titles != null,
             application,
         );
         removeLegacyNestedLeaf(
@@ -1547,17 +1597,40 @@ fn putModelPreference(
         changed = true;
         break :blk &root.getPtr("models").?.object;
     };
-    changed = try putString(arena, models, @tagName(preference.provider), preference.model) or changed;
+    const provider_key = if (preference.provider == .configured) try arena.dupe(u8, preference.provider.label()) else preference.provider.label();
+    changed = try putString(arena, models, provider_key, preference.model) or changed;
     const legacy_key = switch (preference.provider) {
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        .configured => return changed,
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);
         changed = true;
     }
     return changed;
+}
+
+test "configured model preference keys survive their producer frame" {
+    const Producer = struct {
+        noinline fn insert(arena: Allocator, root: *std.json.ObjectMap) !void {
+            _ = try putModelPreference(arena, root, .{ .provider = model_provider.parse("workspace-only-connection").?, .model = "opaque-model" });
+        }
+        noinline fn overwrite_stack() void {
+            var buffer: [8192]u8 = @splat(0xa5);
+            std.mem.doNotOptimizeAway(&buffer);
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var root: std.json.ObjectMap = .empty;
+    try Producer.insert(arena.allocator(), &root);
+    Producer.overwrite_stack();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &output.writer);
+    try std.testing.expectEqualStrings("{\"models\":{\"workspace-only-connection\":\"opaque-model\"}}", output.written());
 }
 
 fn putBool(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !bool {
@@ -1806,7 +1879,7 @@ fn validateKnownSettingsObject(
         while (iterator.next()) |entry| {
             const provider = model_provider.parse(entry.key_ptr.*) orelse
                 return error.InvalidSettingsFormat;
-            if (!std.mem.eql(u8, entry.key_ptr.*, @tagName(provider)) or
+            if (!std.mem.eql(u8, entry.key_ptr.*, provider.label()) or
                 entry.value_ptr.* != .string)
             {
                 return error.InvalidSettingsFormat;
@@ -1815,13 +1888,12 @@ fn validateKnownSettingsObject(
         }
     }
     if (object.get("permission_mode")) |value| {
-        if (value != .string or
-            (!std.ascii.eqlIgnoreCase(value.string, "ask") and
-                !std.ascii.eqlIgnoreCase(value.string, "auto") and
-                !std.ascii.eqlIgnoreCase(value.string, "yolo")))
-        {
+        if (value != .string or types.PermissionMode.parse(value.string) == null) {
             return error.InvalidSettingsFormat;
         }
+    }
+    if (object.get("theme")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
     }
     if (object.get("credential_source")) |value| {
         if (value != .string or types.parseCredentialSource(value.string) == null) {
@@ -2036,6 +2108,29 @@ fn writeStoreFixture(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !v
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+test "user patch accepts existing full access aliases and preserves their spelling" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "full-access", "Full Access", "yolo" }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        const original = try std.fmt.allocPrint(alloc, "{{\"permission_mode\":\"{s}\"}}\n", .{mode});
+        defer alloc.free(original);
+        try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        var store = try Store.initFromHome(alloc, home, .writable);
+        defer store.deinit(alloc);
+        var outcome = try store.applyUserPatch(alloc, .{ .yolo_acknowledged = true });
+        defer outcome.deinit(alloc);
+        try std.testing.expect(outcome == .committed);
+        const bytes = try store.readPrimaryForTest(alloc);
+        defer alloc.free(bytes);
+        try std.testing.expect(std.mem.find(u8, bytes, mode) != null);
+        try std.testing.expect(std.mem.find(u8, bytes, "\"yolo_acknowledged\":true") != null);
+    }
 }
 
 test "user patch writes user preferences at top level" {

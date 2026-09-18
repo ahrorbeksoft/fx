@@ -1,6 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
@@ -84,7 +93,9 @@ function parseReplayJson(output: string): {
   return JSON.parse(output.trim());
 }
 
-async function launchAutomaticRecording(): Promise<{
+async function launchAutomaticRecording(options: {
+  silentBanner?: boolean;
+} = {}): Promise<{
   session: TmuxSession;
   tapePath: string;
   goldenPath: string;
@@ -103,23 +114,33 @@ async function launchAutomaticRecording(): Promise<{
   const goldenPath = join(workDir, "grid.txt");
   const tracePath = join(workDir, "trace.log");
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN} --record`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
     cwd: workDir,
     width: 180,
     height: 36,
     env: {
       HOME: home,
+      FX_DEBUG_RECORD: "1",
+      ...(options.silentBanner
+        ? { FX_DEBUG_RECORD_SILENT_BANNER: "1" }
+        : {}),
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: TRACE_SCOPES,
     },
   });
   session = s;
-  await s.waitForText("visual terminal capture:", 10_000);
-  const grid = (await s.capturePaneGrid()).join("\n");
-  const tapePath = grid.match(/visual terminal capture:\s*(\S+\.fxtape)/)?.[1];
-  if (!tapePath) {
-    throw new Error(`recording path was not printed:\n${grid}`);
+  if (!options.silentBanner) {
+    await s.waitForText("visual terminal capture:", 10_000);
   }
+  await s.waitForComposer(10_000);
+  const recordingsDir = join(home, ".fx", "recordings");
+  const tapes = readdirSync(recordingsDir).filter((name) =>
+    name.endsWith(".fxtape")
+  );
+  if (tapes.length !== 1) {
+    throw new Error(`expected one automatic tape, found ${tapes.length}`);
+  }
+  const tapePath = join(recordingsDir, tapes[0]!);
   return { session: s, tapePath, goldenPath, tracePath, home };
 }
 
@@ -308,14 +329,14 @@ describe("tui: render record/replay", () => {
         { length: 33 },
         (_, index) => `captured input line ${index + 1}: ${"x".repeat(32)}`,
       ).join("\n");
-      const authNotice = "● Auth: fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+      const authNotice = "auth: fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
       const launched = await launch({ recordInput: true });
       session = launched.session;
 
       await session.pasteText(pasted);
       await session.waitForText("[Pasted text #1, 33 lines]", 5_000);
       await session.sendKeys("Enter");
-      await session.waitForText("● Auth: fx needs access", 5_000);
+      await session.waitForText("auth: fx needs access", 5_000);
       expect((await session.captureFullScrollback()).replace(/\s+/g, " ")).toContain(authNotice);
 
       const stdin = readTapeFrames(launched.tapePath)
@@ -402,6 +423,10 @@ describe("tui: render record/replay", () => {
       session = launched.session;
 
       expect(launched.tapePath.startsWith(join(launched.home, ".fx", "recordings"))).toBe(true);
+      expect(statSync(launched.tapePath).mode & 0o077).toBe(0);
+      expect(await session.captureFullScrollback()).toContain(
+        "visual terminal capture:",
+      );
       await session.sendText(marker);
       await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
       await session.sendKeys(`-l '${inputTail}'`);
@@ -427,6 +452,45 @@ describe("tui: render record/replay", () => {
       session = null;
 
       expect(failures).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(SKIP)(
+    "silent automatic recording hides its banner inline but keeps it in Ctrl-O",
+    async () => {
+      const marker = "silent_automatic_recording_marker";
+      const launched = await launchAutomaticRecording({ silentBanner: true });
+      session = launched.session;
+
+      expect(await session.captureFullScrollback()).not.toContain(
+        "visual terminal capture:",
+      );
+      expect(statSync(launched.tapePath).mode & 0o077).toBe(0);
+
+      await session.sendKeys("C-o");
+      await session.waitForText("full detail · ctrl+o close", 5_000);
+      await session.waitForText("visual terminal capture:", 5_000);
+      await session.sendKeys("C-o");
+      await session.waitForComposer(5_000);
+      expect(await session.captureFullScrollback()).not.toContain(
+        "visual terminal capture:",
+      );
+
+      await session.sendText(marker);
+      await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
+      execFileSync(FX_BIN, [
+        "replay",
+        launched.tapePath,
+        "--golden",
+        launched.goldenPath,
+      ]);
+      expect(readFileSync(launched.goldenPath, "utf8")).toContain(marker);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(5_000)).toBe(true);
+      session = null;
     },
     TIMEOUT,
   );

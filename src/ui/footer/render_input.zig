@@ -16,6 +16,7 @@ const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
@@ -35,15 +36,44 @@ const StreamState = types.StreamState;
 const ActivityProjection = activity_runtime.ActivityProjection;
 const InputRuntime = core_input_runtime.Runtime;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
-const SubagentStatus = @import("../../core/subagent/domain.zig").State;
 
 pub const SkillsMenuProjection = struct {
     active: bool = false,
     items: []const skill_runtime.Skill = &.{},
+    actual_indices: []const u32 = &.{},
+    index_ready: bool = false,
     source_filter: skill_runtime.SkillMenuSourceFilter = .all,
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
+
+    pub fn itemCount(self: SkillsMenuProjection) usize {
+        if (self.index_ready) return self.actual_indices.len;
+        return skill_runtime.skillMenuFilterQueryCount(
+            self.items,
+            self.source_filter,
+            self.query,
+        );
+    }
+
+    pub fn itemAt(
+        self: SkillsMenuProjection,
+        display_index: usize,
+    ) ?*const skill_runtime.Skill {
+        if (!self.index_ready) {
+            const actual_index = skill_runtime.skillMenuActualIndexAtQuery(
+                self.items,
+                self.source_filter,
+                self.query,
+                display_index,
+            ) orelse return null;
+            return &self.items[actual_index];
+        }
+        if (display_index >= self.actual_indices.len) return null;
+        const actual_index: usize = self.actual_indices[display_index];
+        if (actual_index >= self.items.len) return null;
+        return &self.items[actual_index];
+    }
 };
 
 pub const ModelMenuProjection = struct {
@@ -349,8 +379,10 @@ pub fn helpMenuProjection(
 
 pub fn skillsMenuProjection(skills: *const skill_runtime.Runtime) SkillsMenuProjection {
     return .{
-        .active = skills.menu.active,
+        .active = skills.menuVisible(),
         .items = skills.items,
+        .actual_indices = skills.menu_index.actual_indices.items,
+        .index_ready = skills.menu_index_ready,
         .source_filter = skills.menu.source_filter,
         .selected_index = skills.menu.selected_index,
         .window_start = skills.menu.window_start,
@@ -373,14 +405,11 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
 
 const max_static_status_activity_rows: u16 = 3;
 
-pub const QueuedPromptCard = struct {
-    bytes: []const u8,
-    editing: bool = false,
-};
-
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
     stream: StreamState,
+    compaction: @import("../../core/output/compaction_activity.zig").Snapshot = .{},
+    pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
     // Pacer emitting visible text, including the post-finish tail drain.
     writing_response: bool = false,
@@ -389,22 +418,9 @@ pub const RenderContext = struct {
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
-    queued_count: usize,
-    steering_count: usize = 0,
-    queued_paused: bool = false,
-    queued_cancel_all_available: bool = false,
-    queued_prompt_cards: []const QueuedPromptCard = &.{},
-    queued_prompt_card_rows: u16 = 0,
-    queued_editor_active: bool = false,
-    subagent_count: usize,
-    subagent_view_active: bool,
-    selected_subagent_id: ?u64,
-    selected_subagent_label: ?[]const u8,
-    selected_subagent_status: ?SubagentStatus,
-    selected_subagent_tool_calls: usize = 0,
-    selected_subagent_activity: ?[]const u8 = null,
-    fast_mode: bool = false,
-    model_supports_fast: bool = false,
+    steering_messages: []const []const u8 = &.{},
+    steering_waits_for_boundary: bool = false,
+    fast_indicator_active: bool = false,
     effort: types.ReasoningEffort = .auto,
     model_supports_effort: bool = false,
     ctrl_c_pending: bool = false,
@@ -418,9 +434,19 @@ pub const RenderContext = struct {
     model_completion_index: usize = 0,
     model_completion_window_start: usize = 0,
     model_completion_anchor: usize = 0,
+    provider_query_active: bool = false,
+    provider_picker_stage: picker_state.ProviderPickerStage = .provider,
+    provider_picker_completions: []const []const u8 = &.{},
+    /// Parallel to `provider_picker_completions`; an empty entry renders no annotation.
+    provider_picker_annotations: []const []const u8 = &.{},
+    provider_picker_completion_index: usize = 0,
+    provider_picker_completion_window_start: usize = 0,
+    provider_picker_completion_anchor: usize = 0,
     file_query_active: bool = false,
     file_completions: []const file_index.SearchResult = &.{},
     file_completion_index: usize = 0,
+    file_completion_has_selection: bool = true,
+    file_completion_status: ?[]const u8 = null,
     file_completion_window_start: usize = 0,
     file_completion_anchor: usize = 0,
     file_completions_loading: bool = false,
@@ -446,6 +472,7 @@ pub const RenderContext = struct {
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
+    esc_interrupt_armed: bool = false,
     question: ?question_prompt.Projection = null,
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
@@ -460,75 +487,151 @@ pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjectio
     return null;
 }
 
-// Trailing blank row that keeps the collapsed summary off the composer.
-pub const collapsed_queue_banner_gap_rows: u16 = 1;
+pub const steering_composer_gap_rows: u16 = 1;
+pub const max_steering_message_rows: u16 = 2;
 
-// Expanded cards plus one blank row between adjacent prompts, so queued drafts
-// read as separate items instead of a single connected block.
-pub fn queuedCardContentRows(ctx: RenderContext) u16 {
-    const between_cards: u16 = @intCast(@min(
-        ctx.queued_prompt_cards.len -| 1,
-        std.math.maxInt(u16),
-    ));
-    return ctx.queued_prompt_card_rows +| between_cards;
-}
-
-// Blank rows framing the expanded cards: one closing the band off the composer,
-// plus one above the paused hint so it reads as the block's footer.
-pub fn queuedCardSpacerRows(ctx: RenderContext) u16 {
-    const above_hint: u16 = @intFromBool(ctx.queued_paused);
-    return 1 +| above_hint;
-}
-
-pub const QueuedBannerFacts = struct {
-    queued_count: usize = 0,
-    paused: bool = false,
-    card_count: usize = 0,
-    card_rows: u16 = 0,
+const SteeringMessageLayout = struct {
+    rows: [max_steering_message_rows][]const u8 = @splat(""),
+    row_count: u16 = 0,
+    content_width: u16,
+    truncated: bool = false,
 };
 
-pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
-    if (facts.queued_count == 0) return 0;
-    const paused_hint_rows: u16 = @intFromBool(facts.paused);
-    if (facts.card_rows > 0) {
-        const between_cards: u16 = @intCast(@min(
-            facts.card_count -| 1,
-            std.math.maxInt(u16),
-        ));
-        const spacer_rows: u16 = 1 +| paused_hint_rows;
-        return facts.card_rows +| between_cards +| paused_hint_rows +| spacer_rows;
+fn steering_unit_width(raw: []const u8) usize {
+    var width: usize = 0;
+    var safe_start: usize = 0;
+    var index: usize = 0;
+    while (index < raw.len) {
+        const rune = display_width.decodeNextRune(raw, index);
+        const end = index + rune.len;
+        if (!text_utils.isTerminalSafe(raw[index..end])) {
+            width += display_width.visibleWidth(raw[safe_start..index]);
+            width += text_utils.terminalSafeVisibleWidth(raw[index..end]);
+            safe_start = end;
+        }
+        index = end;
     }
-    return 1 +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
+    return width + display_width.visibleWidth(raw[safe_start..]);
 }
 
-pub fn queuedBannerRows(ctx: RenderContext) u16 {
-    return queuedBannerRowsForFacts(.{
-        .queued_count = ctx.queued_count,
-        .paused = ctx.queued_paused,
-        .card_count = ctx.queued_prompt_cards.len,
-        .card_rows = ctx.queued_prompt_card_rows,
-    });
+/// Borrows at most two visible row slices; measurement and painting share this layout.
+pub fn steering_message_layout(
+    message: []const u8,
+    width: u16,
+    waits_for_boundary: bool,
+    row_limit: u16,
+) SteeringMessageLayout {
+    var layout: SteeringMessageLayout = .{
+        .content_width = if (waits_for_boundary) width -| 2 else width,
+    };
+    const limit = @min(row_limit, max_steering_message_rows);
+    var offset: usize = 0;
+    while (layout.row_count < limit) {
+        const start = offset;
+        var cells: usize = 0;
+        var ellipsis_end = start;
+        var last_space: ?usize = null;
+        while (offset < message.len and message[offset] != '\n' and message[offset] != '\r') {
+            const unit = display_width.displayUnitAt(message, offset);
+            const raw = message[offset .. offset + unit.byte_len];
+            const unit_width = if (message[offset] == '\t')
+                1
+            else if (text_utils.isTerminalSafe(raw))
+                unit.cell_width
+            else
+                steering_unit_width(raw);
+            if (unit_width > layout.content_width - cells) break;
+            if (message[offset] == ' ' or message[offset] == '\t') last_space = offset;
+            cells += unit_width;
+            offset += unit.byte_len;
+            if (cells < layout.content_width) ellipsis_end = offset;
+        }
+        var end = offset;
+        const soft_separator = offset < message.len and (message[offset] == ' ' or message[offset] == '\t');
+        if (soft_separator) {
+            while (offset < message.len and (message[offset] == ' ' or message[offset] == '\t')) offset += 1;
+        }
+        const hard_break = offset < message.len and (message[offset] == '\n' or message[offset] == '\r');
+        if (hard_break) {
+            const cr = message[offset] == '\r';
+            offset += 1;
+            if (cr and offset < message.len and message[offset] == '\n') offset += 1;
+        } else if (!soft_separator and offset < message.len) {
+            if (last_space) |space| {
+                if (space > start) {
+                    end = space;
+                    offset = space + 1;
+                }
+            }
+        }
+        layout.rows[layout.row_count] = message[start..end];
+        layout.row_count += 1;
+        if (offset == message.len) break;
+        if (layout.row_count == limit or (!hard_break and end == start)) {
+            layout.rows[layout.row_count - 1] = message[start..@min(end, ellipsis_end)];
+            layout.truncated = true;
+            break;
+        }
+    }
+    return layout;
 }
 
-test "queued banner row policy consumes aggregate card facts" {
-    try std.testing.expectEqual(@as(u16, 2), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-    }));
-    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .paused = true,
-    }));
-    try std.testing.expectEqual(@as(u16, 7), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .card_count = 2,
-        .card_rows = 5,
-    }));
-    try std.testing.expectEqual(@as(u16, 9), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .paused = true,
-        .card_count = 2,
-        .card_rows = 5,
-    }));
+pub fn steeringBannerRowsForMessages(
+    messages: []const []const u8,
+    waits_for_boundary: bool,
+    width: u16,
+) u16 {
+    if (messages.len == 0 or !waits_for_boundary) return 0;
+    var rows: u16 = 0;
+    for (messages) |message| {
+        rows +|= steering_message_layout(message, width, waits_for_boundary, max_steering_message_rows).row_count;
+    }
+    return rows +| steering_composer_gap_rows;
+}
+
+pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
+    return steeringBannerRowsForMessages(
+        ctx.steering_messages,
+        ctx.steering_waits_for_boundary,
+        width,
+    );
+}
+
+test "steering banner reserves message rows and one composer gap" {
+    for ([_]bool{ false, true }) |waiting| {
+        try std.testing.expectEqual(@as(u16, if (waiting) 3 else 0), steeringBannerRowsForMessages(&.{"first\nsecond\nthird"}, waiting, 80));
+    }
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        steeringBannerRowsForMessages(&.{}, true, 80),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        steeringBannerRowsForMessages(&.{ "first", "second" }, false, 80),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 5),
+        steeringBannerRowsForMessages(&.{ "first steering message", "second steering message" }, true, 12),
+    );
+}
+
+test "steering preview layout retains prefix slices at row boundaries" {
+    const cases = [_]struct { text: []const u8, width: u16, first: []const u8, second: []const u8, truncated: bool }{
+        .{ .text = "first\r\nsecond\nthird", .width = 20, .first = "first", .second = "second", .truncated = true },
+        .{ .text = "abcdefghij", .width = 4, .first = "abcd", .second = "efg", .truncated = true },
+        .{ .text = "abcd\nefgh", .width = 4, .first = "abcd", .second = "efgh", .truncated = false },
+        .{ .text = "one two three", .width = 7, .first = "one two", .second = "three", .truncated = false },
+        .{ .text = "abc \ndef", .width = 3, .first = "abc", .second = "def", .truncated = false },
+        .{ .text = "界海語", .width = 3, .first = "界", .second = "海", .truncated = true },
+        .{ .text = "first\n\nthird", .width = 20, .first = "first", .second = "", .truncated = true },
+    };
+    for (cases) |case| {
+        const layout = steering_message_layout(case.text, case.width, false, 2);
+        try std.testing.expectEqual(@as(u16, 2), layout.row_count);
+        try std.testing.expectEqualStrings(case.first, layout.rows[0]);
+        try std.testing.expectEqualStrings(case.second, layout.rows[1]);
+        try std.testing.expectEqual(case.truncated, layout.truncated);
+    }
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
@@ -600,6 +703,10 @@ pub fn frameOwnedActivityProjection(
     approval: ?approval_prompt.Projection,
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
+    const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.stream, ctx.now_ms);
+    if (compaction == .none and !ctx.stream.active and ctx.pending_prompt_activity) {
+        return .{ .turn_thinking = .{ .label = "• Thinking" } };
+    }
     switch (ctx.activity) {
         .tool_slot => {},
         .turn_thinking => |thinking| {
@@ -607,7 +714,17 @@ pub fn frameOwnedActivityProjection(
         },
         .none => {},
     }
+    if (compaction != .none) return compaction;
     return turnActivityProjection(buf, shell, ctx);
+}
+
+pub fn frameActivityBlink(ctx: RenderContext) ?bool {
+    if (ctx.compaction.operation) |op| {
+        if (op.active() and op.visible(ctx.now_ms)) {
+            return activity_status.activityBlinkVisible(activity_status.compactionClock(ctx.stream, op), ctx.now_ms);
+        }
+    }
+    return activity_status.activityBlinkVisible(ctx.stream, ctx.now_ms);
 }
 
 fn turnActivityProjection(
@@ -730,6 +847,22 @@ test "skillsMenuProjection mirrors runtime menu state" {
     try std.testing.expectEqualStrings("work", projection.query);
 }
 
+test "skillsMenuProjection hides zero-result mentions and preserves command menus" {
+    var skills = [_]skill_runtime.Skill{
+        .{ .name = "managed", .description = "managed desc", .path = "/tmp/managed/SKILL.md", .source = .global_fx },
+    };
+    var runtime: skill_runtime.Runtime = .{ .items = &skills };
+
+    runtime.openMenuWithQuery(.dollar, .{ .start = 0, .end = "$missing".len }, "missing");
+    try std.testing.expect(!skillsMenuProjection(&runtime).active);
+
+    runtime.menu.setQuery("man");
+    try std.testing.expect(skillsMenuProjection(&runtime).active);
+
+    runtime.openMenuWithQuery(.command, null, "missing");
+    try std.testing.expect(skillsMenuProjection(&runtime).active);
+}
+
 test "modelMenuProjection mirrors cache-owned catalog state" {
     var cache = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models");
     defer cache.deinit();
@@ -803,18 +936,78 @@ test "frame-owned thinking activity projects the thinking label" {
         .stream = .{ .active = true },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .shimmer_pos = 0,
         .input = &input,
     };
 
     var dot_buf: [128]u8 = undefined;
     switch (frameOwnedActivityProjection(&dot_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+}
+
+test "frame compaction overrides idle and tool activity but not blocking feedback or questions" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    var state: @import("../../core/output/compaction_activity.zig").State = .{};
+    const id = state.begin(.manual, null, 1_000);
+    state.running(id, .summary);
+    var ctx: RenderContext = .{
+        .stream = .{},
+        .compaction = state.snapshot,
+        .now_ms = 2_500,
+        .has_api_key = true,
+        .model = "test",
+        .input = &input,
+    };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
+    try std.testing.expect(!ctx.stream.active);
+    ctx.activity = .{ .tool_slot = .{ .entry_id = 1, .fallback_label = "reading", .active = true, .kind = .read } };
+    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    ctx.activity = .{ .turn_thinking = .{ .label = "Blocking status", .tone = .danger } };
+    try std.testing.expectEqualStrings("Blocking status", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
+    ctx.question = null;
+    state.settle(id, .{ .outcome = .cancelled }, 2_500);
+    ctx.compaction = state.snapshot;
+    ctx.activity = .none;
+    try std.testing.expectEqual(ActivityProjection.Tone.neutral, frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.tone);
+    try std.testing.expect(state.dismiss(id, state.snapshot.revision));
+    ctx.compaction = state.snapshot;
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
+}
+
+test "pending prompt projects thinking before the worker stream starts" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    const ctx: RenderContext = .{
+        .stream = .{},
+        .pending_prompt_activity = true,
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .input = &input,
+    };
+
+    var label_buf: [128]u8 = undefined;
+    switch (frameOwnedActivityProjection(&label_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    var retry_ctx = ctx;
+    retry_ctx.activity = .{ .turn_thinking = .{
+        .label = "Previous request failed",
+        .tone = .danger,
+    } };
+    switch (frameOwnedActivityProjection(&label_buf, &shell, retry_ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -831,12 +1024,6 @@ test "frame-owned activity renders the thinking elapsed counter from the frame c
         .now_ms = 4_200,
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -859,12 +1046,6 @@ test "frame-owned activity keeps active tools out of the turn status row" {
         .stream = .{ .active = true, .last_activity_kind = .read, .read_count = 1 },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "reading src/main.zig",
@@ -906,12 +1087,6 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
         },
         .has_api_key = true,
         .model = "test-model",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n",
@@ -975,12 +1150,6 @@ test "frame-owned activity preserves route recovery status tone" {
         .stream = .{},
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
             .label = "⚠ API error · attempt 1/3 failed · retrying",
             .tone = .warning,
@@ -1026,12 +1195,6 @@ test "frame-owned activity shows live streaming token progress" {
         .writing_response = true,
         .has_api_key = true,
         .model = "test-model",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .none,
         .now_ms = 13_000,
         .input = &input,
@@ -1131,12 +1294,6 @@ test "frame-owned activity uses clipped command activity label" {
         },
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "running read-only tools",

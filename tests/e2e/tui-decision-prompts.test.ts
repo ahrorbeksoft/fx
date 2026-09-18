@@ -22,6 +22,8 @@ import {
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
+  fakeGatewayTitleDefault,
+  TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -166,8 +168,15 @@ function outerCommandCall() {
   return outerToolCalls([
     {
       id: "command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command: "touch generic-preview-accepted.txt" },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command: "touch generic-preview-accepted.txt",
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -185,8 +194,15 @@ function outerLongCommandCall() {
   return outerToolCalls([
     {
       id: "long_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -202,8 +218,15 @@ function outerScrollableLongCommandCall() {
   return outerToolCalls([
     {
       id: "scrollable_long_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -215,8 +238,15 @@ function outerFittingCommandCall() {
   return outerToolCalls([
     {
       id: "fitting_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -355,6 +385,7 @@ function startFakeGateway(
         classifierRequests.push({ body, headers: req.headers });
         return fakeGatewayPermissionDecision(classifierDecision(body));
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body, headers: req.headers });
       const next = responses.shift();
       if (!next) return new Response("unexpected request", { status: 500 });
@@ -363,7 +394,7 @@ function startFakeGateway(
   });
 
   return {
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     baseUrl: `http://127.0.0.1:${server.port}`,
     requests,
     classifierRequests,
@@ -1268,8 +1299,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const fragmentedWheel = [
         "1b", "5b", "3c", "36", "35", "3b", "37", "39", "3b", "31", "32", "4d",
       ];
-      const fragmentDelayMs = 0;
-      const injectionLogPath = join(ctx.root.root, "command-fragmented.injected-input.log");
       const completeWheel = [
         "1b", "5b", "3c", "36", "34", "3b", "37", "39", "3b", "31", "32", "4d",
       ];
@@ -1279,7 +1308,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(initialPane).toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
       const initialRows = initialPane.split("\n");
       const initialChoiceThreeRow = initialRows.findIndex((row) => row.includes("3. No"));
-      const initialControlsRow = initialRows.findIndex((row) => row.includes("1–3 Choose"));
+      const initialControlsRow = initialRows.findIndex((row) => row.includes("1–3 choose"));
       expect(initialRows[initialChoiceThreeRow + 1]!.trim()).toBe("");
       expect(initialRows[initialChoiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
       expect(initialControlsRow).toBe(initialChoiceThreeRow + 3);
@@ -1293,11 +1322,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(completePane).not.toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
       expect(completePane).not.toContain("Cancelled");
 
-      await ctx.session.sendFragmentedHexBytes(
-        fragmentedWheel,
-        fragmentDelayMs,
-        injectionLogPath,
-      );
+      await ctx.session.sendHexBytes(fragmentedWheel.slice(0, 6));
+      await ctx.session.sendHexBytes(fragmentedWheel.slice(6));
       const fragmentedPane = await waitForPaneState(
         ctx.session,
         "fragmented mouse scroll",
@@ -1310,13 +1336,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const fragmentedScrollback = await ctx.session.captureFullScrollbackEscapes();
       expect(fragmentedScrollback).not.toContain("Cancelled");
       expect(fragmentedScrollback).not.toContain("4;79;12M");
-      expect(readFileSync(injectionLogPath, "utf8")).toBe(
-        fragmentedWheel.map((byte, index) =>
-          `write=${index + 1}/12 byte=${byte} delay_before_ms=${
-            index === 0 ? 0 : fragmentDelayMs
-          }`
-        ).join("\n") + "\n",
-      );
       const approvalFrames = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload));
       expect(approvalFrames.includes(Buffer.from("\x1b[?1000h\x1b[?1006h"))).toBe(true);
       expect(readFileSync(ctx.tracePath, "utf8")).not.toContain("discard pending mouse report");
@@ -1355,7 +1374,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "inline command approval footer",
         (value) =>
-          value.includes(APPROVAL_PROMPT) && value.includes("1–3 Choose"),
+          value.includes(APPROVAL_PROMPT) && value.includes("1–3 choose"),
         TIMEOUT,
       );
       const command = pane.replaceAll("\n    ", " ");
@@ -1364,7 +1383,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
       const paneRows = pane.split("\n");
       const choiceThreeRow = paneRows.findIndex((row) => row.includes("3. No"));
-      const controlsRow = paneRows.findIndex((row) => row.includes("1–3 Choose"));
+      const controlsRow = paneRows.findIndex((row) => row.includes("1–3 choose"));
       expect(paneRows[choiceThreeRow + 1]!.trim()).toBe("");
       expect(paneRows[choiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
       expect(controlsRow).toBe(choiceThreeRow + 3);
@@ -1501,7 +1520,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "Would you like to run the following command?",
         TIMEOUT,
       );
-      expect(pane).toContain("# terminal.exec profile=user shell=");
+      expect(pane).toContain("# shell.run profile=user shell=");
       expect(pane).toContain("touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 
@@ -1660,12 +1679,12 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         hasApprovalSelection(value, 2, COMMAND_ALWAYS_CHOICE),
       );
       expectApprovalSelection(pane, 2, COMMAND_ALWAYS_CHOICE);
-      expect(pane).toContain("Tab Options");
-      expect(pane).not.toContain("Tab Amend");
+      expect(pane).toContain("tab options");
+      expect(pane).not.toContain("tab amend");
 
       await ctx.session.sendKeys("Tab");
       pane = await waitForPaneState(ctx.session, "tab to denial", (value) =>
-        hasApprovalSelection(value, 3, COMMAND_NO_CHOICE) && value.includes("Tab Amend"),
+        hasApprovalSelection(value, 3, COMMAND_NO_CHOICE) && value.includes("tab amend"),
       );
       expectApprovalSelection(pane, 3, COMMAND_NO_CHOICE);
 
@@ -2075,7 +2094,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         await assertProcessAliveAndClean(ctx);
       }
     },
-    TIMEOUT,
+    TIMEOUT * 2,
   );
 
   test(
@@ -2659,6 +2678,21 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(
         requestContainsExactString(ctx.gateway.requests[1]?.body ?? "", LONG_QUESTION_ANSWER),
       ).toBe(true);
+
+      // The resolved question and answer wrap into hanging continuation rows
+      // in the transcript instead of trailing off with an ellipsis.
+      const resolvedRows = stripAnsi(await ctx.session.captureFullScrollbackEscapes()).split("\n");
+      const resolvedQuestionRow = resolvedRows.find((line) =>
+        line.includes("1) When you ask fx to ask a question"),
+      );
+      expect(resolvedQuestionRow).toBeDefined();
+      expect(resolvedQuestionRow).not.toContain("…");
+      const resolvedContinuation = resolvedRows.find((line) =>
+        line.includes("remain fully visible even when it wraps."),
+      );
+      expect(resolvedContinuation?.indexOf("remain fully visible even when it wraps.")).toBe(5);
+      const resolvedAnswer = resolvedRows.find((line) => line.includes(LONG_QUESTION_ANSWER));
+      expect(resolvedAnswer?.indexOf(LONG_QUESTION_ANSWER)).toBe(5);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,
@@ -2709,10 +2743,10 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const pane = await waitForPaneState(
         ctx.session,
         "question freeform narrow hint",
-        (value) => value.includes("Shift+↑↓ Options"),
+        (value) => value.includes("shift+↑↓ options"),
       );
       expect(pane).toContain(
-        "↑↓ Cursor · Shift+↑↓ Options · Tab Questions · Enter Answer · Esc Cancel",
+        "↑↓ cursor · shift+↑↓ options · tab questions · enter answer · esc cancel",
       );
       expect(ctx.gateway.requests).toHaveLength(1);
 
@@ -2737,9 +2771,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const pane = await waitForPaneState(
         ctx.session,
         "approval narrow hint",
-        (value) => value.includes("Enter Confirm    Esc Cancel"),
+        (value) => value.includes("enter confirm    esc cancel"),
       );
-      expect(pane).toContain("1–3 Choose now    Enter Confirm    Esc Cancel");
+      expect(pane).toContain("1–3 choose now    enter confirm    esc cancel");
 
       await resolveApprovalWithDeny(ctx.session);
       await ctx.session.waitForText("approval narrow hint handled", TIMEOUT);

@@ -437,7 +437,7 @@ pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
             modified = true;
             try out.writer.writeAll(text[i..span.prefix_end]);
             try out.writer.writeAll("[redacted]");
-            debug_trace.logf("core", "model-facing secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
+            debug_trace.logf("core", "secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
             i = span.prefix_end + span.value_len;
         } else {
             try out.writer.writeByte(text[i]);
@@ -446,60 +446,6 @@ pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     }
     if (!modified) return text;
     return try out.toOwnedSlice();
-}
-
-/// Returns true when a secret candidate begins before the retained suffix and
-/// cannot be classified until later bytes arrive on the same logical line.
-pub fn secretMayCrossBoundary(text: []const u8, retained_suffix_bytes: usize) bool {
-    const retained_start = text.len -| retained_suffix_bytes;
-
-    var assignment_end = text.len;
-    if (assignment_end > 0 and
-        (text[assignment_end - 1] == '"' or text[assignment_end - 1] == '\''))
-    {
-        assignment_end -= 1;
-    }
-    if (assignment_end > 0 and text[assignment_end - 1] == '=') {
-        const key_end = assignment_end - 1;
-        var unfinished_key_start = key_end;
-        while (unfinished_key_start > 0 and
-            isAssignmentKeyChar(text[unfinished_key_start - 1]))
-        {
-            unfinished_key_start -= 1;
-        }
-        if (unfinished_key_start < retained_start and
-            sensitiveAssignmentKey(text[unfinished_key_start..key_end]))
-        {
-            return true;
-        }
-    }
-
-    var key_start = text.len;
-    while (key_start > 0 and isAssignmentKeyChar(text[key_start - 1])) {
-        key_start -= 1;
-    }
-    if (key_start < retained_start and
-        sensitiveAssignmentKey(text[key_start..]))
-    {
-        return true;
-    }
-
-    const prefix = "https://";
-    var search_start: usize = 0;
-    while (std.mem.findPos(u8, text, search_start, prefix)) |url_start| {
-        const credential_start = url_start + prefix.len;
-        var end = credential_start;
-        while (end < text.len and
-            text[end] != '\n' and
-            text[end] != '\r' and
-            !std.ascii.isWhitespace(text[end])) : (end += 1)
-        {
-            if (text[end] == '/' or text[end] == '?' or text[end] == '#' or text[end] == '@') break;
-        }
-        if (end == text.len and url_start < retained_start) return true;
-        search_start = if (end < text.len) end + 1 else text.len;
-    }
-    return false;
 }
 
 pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
@@ -672,9 +618,12 @@ fn findSecretSpan(text: []const u8, start: usize) ?SecretSpan {
     if (matchesAwsAccessKey(text, start)) |span| return span;
     if (matchesSensitiveAssignment(text, start)) |span| return span;
     for (secret_prefixes) |prefix| {
-        if (start + prefix.len < text.len and eqlIgnoreCase(text[start .. start + prefix.len], prefix)) {
+        if ((start == 0 or !isAssignmentKeyChar(text[start - 1])) and
+            start + prefix.len < text.len and
+            eqlIgnoreCase(text[start .. start + prefix.len], prefix))
+        {
             const value_start = start + prefix.len;
-            if (assignmentValueSpan(text, value_start)) |value| {
+            if (secretAssignmentValueSpan(text, start, value_start)) |value| {
                 return .{ .prefix_end = value.prefix_end, .value_len = value.value_len, .kind = "assignment" };
             }
         }
@@ -758,7 +707,7 @@ fn matchesSensitiveAssignment(text: []const u8, start: usize) ?SecretSpan {
     if (!sensitiveAssignmentKey(key)) return null;
 
     const value_start = eq + 1;
-    if (assignmentValueSpan(text, value_start)) |value| {
+    if (secretAssignmentValueSpan(text, start, value_start)) |value| {
         return .{ .prefix_end = value.prefix_end, .value_len = value.value_len, .kind = "assignment" };
     }
     return null;
@@ -769,7 +718,71 @@ const AssignmentValueSpan = struct {
     value_len: usize,
 };
 
-fn assignmentValueSpan(text: []const u8, value_start: usize) ?AssignmentValueSpan {
+fn secretAssignmentValueSpan(
+    text: []const u8,
+    assignment_start: usize,
+    value_start: usize,
+) ?AssignmentValueSpan {
+    const value = assignmentValueSpan(text, assignment_start, value_start) orelse return null;
+    if (isPureSymbolicAssignment(text, assignment_start, value_start, value)) return null;
+    return value;
+}
+
+fn isPureSymbolicAssignment(
+    text: []const u8,
+    assignment_start: usize,
+    value_start: usize,
+    value: AssignmentValueSpan,
+) bool {
+    if (text[value_start] == '\'') return false;
+    if (!isPureShellVariableReference(
+        text[value.prefix_end .. value.prefix_end + value.value_len],
+    )) return false;
+    const value_end = value.prefix_end + value.value_len;
+    const outer_double_quoted = assignment_start > 0 and
+        text[assignment_start - 1] == '"';
+    if (text[value_start] != '"' and !outer_double_quoted) {
+        return value_end == text.len or isShellWordBoundary(text, value_end);
+    }
+
+    const closing_quote = value_end;
+    if (closing_quote >= text.len or text[closing_quote] != '"') return false;
+    const next = closing_quote + 1;
+    return next == text.len or isShellWordBoundary(text, next);
+}
+
+fn isShellWordBoundary(text: []const u8, index: usize) bool {
+    return switch (text[index]) {
+        ' ', '\t', '\n', ';', '&', '|', ')' => true,
+        '<', '>' => index + 1 == text.len or text[index + 1] != '(',
+        else => false,
+    };
+}
+
+fn isPureShellVariableReference(value: []const u8) bool {
+    if (value.len < 2 or value[0] != '$') return false;
+    if (value[1] == '{') {
+        if (value.len < 4 or value[value.len - 1] != '}') return false;
+        return isShellVariableName(value[2 .. value.len - 1]);
+    }
+    return isShellVariableName(value[1..]);
+}
+
+fn isShellVariableName(value: []const u8) bool {
+    if (value.len == 0 or !(std.ascii.isAlphabetic(value[0]) or value[0] == '_')) {
+        return false;
+    }
+    for (value[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return true;
+}
+
+fn assignmentValueSpan(
+    text: []const u8,
+    assignment_start: usize,
+    value_start: usize,
+) ?AssignmentValueSpan {
     if (value_start >= text.len) return null;
 
     if (text[value_start] == '"' or text[value_start] == '\'') {
@@ -779,6 +792,16 @@ fn assignmentValueSpan(text: []const u8, value_start: usize) ?AssignmentValueSpa
         while (end < text.len and text[end] != '\n' and text[end] != '\r' and text[end] != quote) : (end += 1) {}
         const value_len = end - content_start;
         if (value_len >= 1) return .{ .prefix_end = content_start, .value_len = value_len };
+        return null;
+    }
+
+    if (assignment_start > 0 and text[assignment_start - 1] == '"') {
+        var end = value_start;
+        while (end < text.len and text[end] != '\n' and text[end] != '\r' and
+            text[end] != '"') : (end += 1)
+        {}
+        const value_len = end - value_start;
+        if (value_len >= 1) return .{ .prefix_end = value_start, .value_len = value_len };
         return null;
     }
 
@@ -947,6 +970,76 @@ test "maskSecrets masks quoted sensitive assignments" {
     try std.testing.expect(std.mem.find(u8, masked, "access-secret") == null);
 }
 
+test "maskSecrets preserves pure symbolic sensitive assignments" {
+    const alloc = std.testing.allocator;
+    const input =
+        "AI_GATEWAY_API_KEY=\"$key\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=$key\" \"$@\"\n" ++
+        "GITHUB_TOKEN=$token\n" ++
+        "DATABASE_URL=\"${database_url}\"\n" ++
+        "TOKEN=\"$token\"; run-next\n" ++
+        "PASSWORD=\"$password\"\tcheck-next\n" ++
+        "ACCESS_TOKEN=\"$token\">token.out\n" ++
+        "SECRET_KEY=\"$key\")";
+
+    const masked = try maskSecrets(alloc, input);
+    defer if (masked.ptr != input.ptr) alloc.free(masked);
+
+    try std.testing.expectEqualStrings(input, masked);
+}
+
+test "maskSecrets masks compound or literal sensitive assignments" {
+    const alloc = std.testing.allocator;
+    const input =
+        "AI_GATEWAY_API_KEY=\"literal-value\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=literal-value\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=$key literal-suffix\"\n" ++
+        "sandbox -e \"GITHUB_TOKEN=$token;literal-suffix\"\n" ++
+        "sandbox -e \"ACCESS_TOKEN=$token>token.out\"\n" ++
+        "sandbox -e \"SECRET_KEY=$key$tail\"\n" ++
+        "sandbox -e \"GITHUB_TOKEN=$token-suffix\"\n" ++
+        "sandbox -e \"API_KEY=$(load-key)\"\n" ++
+        "GITHUB_TOKEN=\"$token-suffix\"\n" ++
+        "DATABASE_URL=\"${database_url:-fallback}\"\n" ++
+        "API_KEY=\"$(load-key)\"\n" ++
+        "VERCEL_OIDC_TOKEN=\"$token\"literal-suffix\n" ++
+        "OPENAI_API_KEY=$key\"literal-suffix\"\n" ++
+        "PASSWORD=\"$password\"\x0bliteral-suffix\n" ++
+        "ACCESS_TOKEN=\"$token\"\x0cliteral-suffix\n" ++
+        "SECRET=\"$secret\"\rliteral-suffix\n" ++
+        "AI_GATEWAY_API_KEY=\"$key\"(literal-suffix)\n" ++
+        "GITHUB_TOKEN=\"$token\"<(literal-suffix)\n" ++
+        "ACCESS_TOKEN=\"$token\">(literal-suffix)\n" ++
+        "SECRET_KEY=\"$key";
+
+    const masked = try maskSecrets(alloc, input);
+    defer if (masked.ptr != input.ptr) alloc.free(masked);
+
+    try std.testing.expectEqualStrings(
+        "AI_GATEWAY_API_KEY=\"[redacted]\"\n" ++
+            "sandbox -e \"AI_GATEWAY_API_KEY=[redacted]\"\n" ++
+            "sandbox -e \"AI_GATEWAY_API_KEY=[redacted]\"\n" ++
+            "sandbox -e \"GITHUB_TOKEN=[redacted]\"\n" ++
+            "sandbox -e \"ACCESS_TOKEN=[redacted]\"\n" ++
+            "sandbox -e \"SECRET_KEY=[redacted]\"\n" ++
+            "sandbox -e \"GITHUB_TOKEN=[redacted]\"\n" ++
+            "sandbox -e \"API_KEY=[redacted]\"\n" ++
+            "GITHUB_TOKEN=\"[redacted]\"\n" ++
+            "DATABASE_URL=\"[redacted]\"\n" ++
+            "API_KEY=\"[redacted]\"\n" ++
+            "VERCEL_OIDC_TOKEN=\"[redacted]\"literal-suffix\n" ++
+            "OPENAI_API_KEY=[redacted]\"literal-suffix\"\n" ++
+            "PASSWORD=\"[redacted]\"\x0bliteral-suffix\n" ++
+            "ACCESS_TOKEN=\"[redacted]\"\x0cliteral-suffix\n" ++
+            "SECRET=\"[redacted]\"\rliteral-suffix\n" ++
+            "AI_GATEWAY_API_KEY=\"[redacted]\"(literal-suffix)\n" ++
+            "GITHUB_TOKEN=\"[redacted]\"<(literal-suffix)\n" ++
+            "ACCESS_TOKEN=\"[redacted]\">(literal-suffix)\n" ++
+            "SECRET_KEY=\"[redacted]",
+        masked,
+    );
+}
+
 test "maskSecrets preserves non-sensitive quoted assignments" {
     const alloc = std.testing.allocator;
     const input = "PROJECT_NAME=\"secret-service\"\nGREETING='hello world'";
@@ -998,37 +1091,6 @@ test "maskSecrets masks expanded model-facing secret patterns" {
         masked,
     );
     try std.testing.expect(std.mem.find(u8, masked, "AKIA0123456789ABCDEF") == null);
-}
-
-test "secret boundary analysis preserves resolved URLs and catches unfinished candidates" {
-    try std.testing.expect(!secretMayCrossBoundary(
-        "prefix https://example.com suffix ",
-        64,
-    ));
-    try std.testing.expect(secretMayCrossBoundary(
-        "MY_VERY_LONG_TOKEN_KEY",
-        4,
-    ));
-    try std.testing.expect(secretMayCrossBoundary(
-        "MY_VERY_LONG_TOKEN_KEY=",
-        4,
-    ));
-    try std.testing.expect(secretMayCrossBoundary(
-        "MY_VERY_LONG_TOKEN_KEY=\"",
-        4,
-    ));
-    try std.testing.expect(secretMayCrossBoundary(
-        "MY_VERY_LONG_TOKEN_KEY='",
-        4,
-    ));
-    try std.testing.expect(secretMayCrossBoundary(
-        "prefix https://user:password",
-        4,
-    ));
-    try std.testing.expect(!secretMayCrossBoundary(
-        "prefix ORDINARY_KEY",
-        4,
-    ));
 }
 
 test "redactUrlForDisplay masks credential-like query values" {

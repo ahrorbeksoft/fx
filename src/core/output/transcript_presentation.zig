@@ -121,6 +121,15 @@ pub const State = struct {
         return next;
     }
 
+    pub fn defer_full_open(self: State) State {
+        var next = self;
+        next.bookmark_pending = !next.follow_tail;
+        next.bookmark_entry_id = null;
+        next.bookmark_intra_row = 0;
+        next.depth = .inline_mode;
+        return next;
+    }
+
     pub fn scroll(self: State, direction: ScrollDirection, rows: u32) State {
         var next = self;
         next.follow_tail = false;
@@ -199,7 +208,7 @@ pub const State = struct {
     }
 
     fn open_full(self: State) State {
-        var next = self.reset_viewport();
+        var next = if (self.bookmark_pending) self else self.reset_viewport();
         next.depth = .full;
         // The identity remains available for retention retargeting, but a
         // normal open starts at the tail instead of consuming the old anchor.
@@ -228,6 +237,9 @@ pub const State = struct {
         var selected: ?ItemRow = null;
         for (item_rows) |item| {
             if (item.row > offset) break;
+            // Synthetic full-detail records share the never-issued id 0 and
+            // are not addressable restore anchors.
+            if (item.entry_id == 0) continue;
             selected = item;
         }
         const item = selected orelse if (item_rows.len > 0)
@@ -305,6 +317,27 @@ test "transcript presentation scroll saturates and leaves follow tail" {
     try std.testing.expectEqual(std.math.maxInt(u32), at_end.scroll_rows);
 }
 
+test "transcript presentation deferred full open retains its exact offset" {
+    const deferred = (State{
+        .depth = .full,
+        .scroll_rows = 47,
+        .follow_tail = false,
+        .bookmark_entry_id = 2,
+        .bookmark_intra_row = 7,
+    }).defer_full_open();
+    try std.testing.expectEqual(Depth.inline_mode, deferred.depth);
+    try std.testing.expect(deferred.bookmark_pending);
+    try std.testing.expectEqual(@as(?u32, null), deferred.bookmark_entry_id);
+
+    const reopened = deferred.with_depth(.full).select_visual_offset(
+        100,
+        10,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(u32, 47), reopened.offset);
+    try std.testing.expect(!reopened.state.follow_tail);
+}
+
 test "transcript presentation clamps bookmarks and selects retained neighbor" {
     const item_rows = [_]ItemRow{
         .{ .entry_id = 10, .row = 1 },
@@ -352,4 +385,18 @@ test "transcript presentation snapshot round trips all state" {
         .projection_cols = 40,
     };
     try std.testing.expectEqualDeep(state, State.from_snapshot(state.snapshot()));
+}
+
+test "transcript presentation bookmark skips synthetic id-0 full-detail records" {
+    const item_rows = [_]ItemRow{
+        .{ .entry_id = 0, .row = 1 },
+        .{ .entry_id = 0, .row = 4 },
+        .{ .entry_id = 10, .row = 8 },
+    };
+    const selected = (State{}).select_visual_offset(14, 4, &item_rows);
+    try std.testing.expectEqual(@as(?u32, 10), selected.state.bookmark_entry_id);
+
+    const records_only = [_]ItemRow{.{ .entry_id = 0, .row = 1 }};
+    const degenerate = (State{}).select_visual_offset(8, 4, &records_only);
+    try std.testing.expectEqual(@as(?u32, 0), degenerate.state.bookmark_entry_id);
 }

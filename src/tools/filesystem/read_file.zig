@@ -1,12 +1,10 @@
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
-const permission_gate = @import("../../core/permissions/permission_gate.zig");
 const read_tracker = @import("../../core/workspace/read_tracker.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
-const write_file_impl = @import("write_file.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -431,25 +429,6 @@ const read_file_dispatch_tool = tool_dispatch.Tool{
     .irreversible_fn = isIrreversible,
 };
 
-const write_file_dispatch_tool = tool_dispatch.Tool{
-    .name = "write_file",
-    .description = "Write file dispatch test fixture.",
-    .model_schema = .{
-        .name = "write_file",
-        .description = "Write file dispatch test fixture.",
-    },
-    .executor_kind = .write_file,
-    .activity_kind = .write,
-    .requires_approval = true,
-    .permission_target_kind = .path_create_parent,
-    .decode = write_file_impl.decode,
-    .validate = write_file_impl.validate,
-    .call = write_file_impl.call,
-    .take_file_mutation_input_fn = write_file_impl.takeFileMutationInput,
-    .reads_only_fn = write_file_impl.readsOnly,
-    .irreversible_fn = write_file_impl.isIrreversible,
-};
-
 fn dispatchReadFileInWorkspace(alloc: Allocator, workspace_root: []const u8, args_json: []const u8) !tool_dispatch.DispatchResult {
     const registry = tool_dispatch.Registry{ .tools = &.{read_file_dispatch_tool} };
     return tool_dispatch.dispatchToolCall(.{ .allocator = alloc, .permission_mode = .auto, .workspace_root = workspace_root }, registry, .{
@@ -479,46 +458,6 @@ fn dispatchReadFileWithTrackerInWorkspace(alloc: Allocator, workspace_root: []co
 
 fn dispatchReadFileWithTracker(alloc: Allocator, args_json: []const u8, tracker: *read_tracker.ReadTracker) !tool_dispatch.DispatchResult {
     return dispatchReadFileWithTrackerInWorkspace(alloc, "", args_json, tracker);
-}
-
-fn allowDecision(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: tool_dispatch.DispatchContext) permission_gate.Decision {
-    return .{ .action = .allow, .reason = "allowed by test" };
-}
-
-fn writeFileArgsJson(alloc: Allocator, path: []const u8, content: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(path, .{}, &out.writer);
-    try out.writer.writeAll(",\"content\":");
-    try std.json.Stringify.value(content, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
-}
-
-fn dispatchWriteFileWithTracker(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    path: []const u8,
-    content: []const u8,
-    tracker: *read_tracker.ReadTracker,
-) !tool_dispatch.DispatchResult {
-    const args_json = try writeFileArgsJson(alloc, path, content);
-    defer alloc.free(args_json);
-
-    const registry = tool_dispatch.Registry{ .tools = &.{write_file_dispatch_tool} };
-    return tool_dispatch.dispatchToolCall(.{
-        .allocator = alloc,
-        .permission_mode = .auto,
-        .permission_decider = allowDecision,
-        .workspace_root = workspace_root,
-        .read_tracker = tracker,
-    }, registry, .{
-        .id = "call_2",
-        .name = "write_file",
-        .arguments_json = args_json,
-    });
 }
 
 fn tmpPath(alloc: Allocator, tmp: std.testing.TmpDir, sub_path: []const u8) ![]u8 {
@@ -604,6 +543,7 @@ test "read_file access denial returns structured recovery" {
     const alloc = std.testing.allocator;
     const result = try readFileFailure(alloc, error.AccessDenied, "/tmp/blocked/read.txt");
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| {
             defer alloc.free(body);
             try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));
@@ -623,6 +563,7 @@ test "read_file non-regular paths return structured recovery" {
     const alloc = std.testing.allocator;
     const result = try readFileFailure(alloc, error.NotRegularFile, "/tmp/search-pipe");
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| {
             defer alloc.free(body);
             try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));

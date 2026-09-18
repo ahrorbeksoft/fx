@@ -6,27 +6,32 @@ const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
-const session_test_controls = @import("session_test_controls.zig");
 const session_codec = @import("../core/session/session_codec.zig");
+const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
+const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const agent_execution_memory = @import("../core/agent/execution_memory.zig");
+const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
+const tool_call_presentation = @import("tool_call_presentation.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const project_config = @import("../core/mcp/project_config.zig");
 const workspace_config = @import("../core/mcp/workspace_config.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
-const command_specs = @import("../core/slash_commands/command_specs.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -35,6 +40,51 @@ else
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
+
+pub fn handleNewLibfxSession(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+) !void {
+    try server.releaseActiveSession(state);
+    const session_id = try session_store.generateSessionId(alloc);
+    var session_id_owned = true;
+    defer if (session_id_owned) alloc.free(session_id);
+    const model = try alloc.dupe(u8, state.selected_model);
+    var model_owned = true;
+    defer if (model_owned) alloc.free(model);
+    var session_rt = session_runtime.SessionRuntime.initWithProviders(
+        state.cfg.max_history_turns,
+        state.cfg.provider_set.deferredUsageProviders(),
+    );
+    var session_rt_owned = true;
+    defer if (session_rt_owned) session_rt.deinit(alloc);
+
+    state.active_session = .{
+        .session_id = session_id,
+        .model = model,
+        .provider = state.provider,
+        .mode = state.cfg.mode_registry.default_mode_id,
+        .workspace_root = state.workspace_root,
+        .api_key = state.api_key,
+        .credential_source = state.credential_source,
+        .account_id = state.account_id,
+        .agent_step_limit = state.agent_step_limit,
+        .max_tool_result_bytes = state.max_tool_result_bytes,
+        .fast_mode = state.fast_mode,
+        .effort = state.effort,
+        .first_call_tool_choice = state.first_call_tool_choice,
+        .permission_mode = state.permission_mode,
+        .permission_rules = state.permission_rules,
+        .session_rt = session_rt,
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    session_id_owned = false;
+    model_owned = false;
+    session_rt_owned = false;
+    try writeNewSessionResponse(state, alloc, msg, session_id);
+}
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     try server.releaseActiveSession(state);
@@ -72,6 +122,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
+        .credential_refresh_after_ms = state.credential_refresh_after_ms,
         .account_id = state.account_id,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
@@ -104,7 +155,7 @@ pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionS
     const permission_state = try session.session_rt.snapshotPermissionState(alloc);
     next.permission_state.deinit(alloc);
     next.permission_state = permission_state;
-    next.context_history_start = session.session_rt.context_history_start;
+    next.context_history_start = 0;
     next.conversation_language = session.session_rt.languageSnapshot();
     next.updated_at_ms = io_mod.milliTimestamp();
     alloc.free(next.preferences.model);
@@ -186,7 +237,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     var writable = store.startWritableSessionWithOptions(
         alloc,
         initial,
-        session_test_controls.logOptions(),
+        .{},
     ) catch
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to create session" });
     var writable_owned = true;
@@ -218,6 +269,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             writable.state.created_at_ms,
         );
     }
+    writable.releaseHydrationHistory(alloc);
     session_rt.configureWebFetchArtifacts(alloc, session_dir);
     server.cancelAndReapActivePrompt(state);
     activateSession(state, store, .{
@@ -253,6 +305,7 @@ fn writeNewSessionResponse(
     msg: *jsonrpc.Message,
     session_id: []const u8,
 ) !void {
+    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -260,7 +313,7 @@ fn writeNewSessionResponse(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -274,6 +327,10 @@ fn writeNewSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
+    if (effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -282,9 +339,7 @@ fn writeNewSessionResponse(
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 
-    const commands_json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(commands_json);
-    try sendAvailableCommands(state, alloc, session_id, commands_json);
+    try sendAvailableCommands(state, alloc, session_id, "[]");
 }
 
 pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -305,7 +360,8 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
-            for (active.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+            for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+            try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(state, alloc, msg, active.model);
         }
     }
@@ -334,7 +390,6 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         alloc,
         loaded.state.conversation_language,
         loaded.state.history,
-        loaded.state.context_history_start,
         loaded.state.permission_state,
     );
     if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
@@ -350,6 +405,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
+        .credential_refresh_after_ms = state.credential_refresh_after_ms,
         .account_id = state.account_id,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
@@ -366,7 +422,8 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    for (state.active_session.?.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    try sendActiveSessionInfoUpdate(state, alloc);
     try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model);
 }
 
@@ -517,9 +574,7 @@ fn handleRestoreSession(
             }
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
-                for (active.session_rt.history.items) |turn| {
-                    try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-                }
+                try sendActiveHistoryUpdates(state, alloc, session_id);
             }
             try sendPendingRecoveryUpdate(
                 state,
@@ -527,6 +582,7 @@ fn handleRestoreSession(
                 session_id,
                 if (active.writable) |*writable| writable.state.recovery_checkpoint else null,
             );
+            try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(
                 state,
                 alloc,
@@ -560,7 +616,7 @@ fn handleRestoreSession(
         state.workspace_root,
         .{
             .seed_preferences = seed_preferences,
-            .log = session_test_controls.logOptions(),
+            .log = .{},
         },
     ) catch |err| return handleLoadFailure(state, alloc, msg, err);
     var writable_owned = true;
@@ -569,25 +625,29 @@ fn handleRestoreSession(
     const sid_copy = try alloc.dupe(u8, writable.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
-    const effective_provider = if (state.process_model_override)
+    const effective_provider = if (state.process_provider_override)
         state.provider
     else
         writable.state.preferences.provider;
-    const effective_model = if (state.process_model_override)
+    const effective_model = if (state.process_model_override or state.process_provider_override)
         state.selected_model
     else
         writable.state.preferences.model;
-    if (!try server.selectCredentialForProvider(state, effective_provider)) {
+    var staged_credential = server.prepareCredentialForProvider(state, effective_provider) catch |err| {
+        if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = if (effective_provider == .codex)
                 credentials.missing_chatgpt_credential_message
             else if (effective_provider == .grok)
                 credentials.missing_grok_credential_message
+            else if (effective_provider == .configured)
+                "Configured provider authentication is unavailable"
             else
                 credentials.missing_credential_message,
         });
-    }
+    };
+    defer if (staged_credential) |*credential| credential.deinit(alloc);
     const model_copy = try alloc.dupe(u8, effective_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
@@ -603,7 +663,6 @@ fn handleRestoreSession(
         alloc,
         writable.state.conversation_language,
         writable.state.history,
-        writable.state.context_history_start,
         writable.state.permission_state,
     );
     if (writable.state.usage) |usage| {
@@ -620,6 +679,7 @@ fn handleRestoreSession(
     const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, session_id);
     defer alloc.free(session_dir);
 
+    writable.releaseHydrationHistory(alloc);
     session_rt.configureWebFetchArtifacts(alloc, session_dir);
     server.cancelAndReapActivePrompt(state);
     activateSession(state, store, .{
@@ -627,6 +687,7 @@ fn handleRestoreSession(
         .writable = writable,
         .model = model_copy,
         .provider = effective_provider,
+        .credential = if (staged_credential) |*credential| credential else null,
         .fast_mode = writable.state.preferences.fast_mode,
         .effort = writable.state.preferences.effort,
         .session_rt = session_rt,
@@ -643,9 +704,7 @@ fn handleRestoreSession(
     session_rt_owned = false;
     session_mcp_owned = false;
     if (kind.replaysHistory()) {
-        for (state.active_session.?.writable.?.state.history) |turn| {
-            try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-        }
+        try sendActiveHistoryUpdates(state, alloc, session_id);
     }
     try sendPendingRecoveryUpdate(
         state,
@@ -653,6 +712,7 @@ fn handleRestoreSession(
         session_id,
         state.active_session.?.writable.?.state.recovery_checkpoint,
     );
+    try sendActiveSessionInfoUpdate(state, alloc);
 
     try writeLoadSessionResponse(
         state,
@@ -753,7 +813,7 @@ fn sendPendingRecoveryUpdate(
     checkpoint: ?session_codec.RecoveryCheckpoint,
 ) !void {
     const recovery = checkpoint orelse return;
-    try sendUserHistoryChunk(state, alloc, session_id, recovery.user.text);
+    try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
     try sendExecutionHistory(state, alloc, session_id, recovery.execution);
     if (recovery.assistant_source.len > 0) {
         try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
@@ -794,11 +854,12 @@ fn writeLoadSessionResponse(
     msg: *jsonrpc.Message,
     model: []const u8,
 ) !void {
+    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -812,6 +873,10 @@ fn writeLoadSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
+    if (effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -860,6 +925,7 @@ const SessionActivation = struct {
     writable: session_store.LoadedWritableSession,
     model: []u8,
     provider: model_provider.ProviderId,
+    credential: ?*credentials.Credential = null,
     fast_mode: bool,
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
@@ -872,6 +938,7 @@ fn activateSession(
     activation: SessionActivation,
 ) !void {
     try server.releaseActiveSession(state);
+    if (activation.credential) |credential| server.adoptServerCredential(state, credential);
     state.active_session = .{
         .session_id = activation.session_id,
         .store = store,
@@ -882,6 +949,7 @@ fn activateSession(
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
+        .credential_refresh_after_ms = state.credential_refresh_after_ms,
         .account_id = state.account_id,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
@@ -910,27 +978,27 @@ fn activateSession(
     } else {
         state.active_session.?.session_rt.usage.clearReconciliationCredential();
     }
-    activateManagedBackground(state, store);
-}
-
-fn activateManagedBackground(
-    state: *server.ServerState,
-    store: session_store.Store,
-) void {
-    const active = if (state.active_session) |*session| session else return;
-    const writable = if (active.writable) |*value| value else return;
-    state.background.restoreWorkspaceFromStore(
-        std.heap.c_allocator,
-        store,
-        state.workspace_root,
-        writable.active_id,
-    ) catch {};
-    state.background.restoreFromManagedPersistence(
-        std.heap.c_allocator,
-        writable.childCapability() catch return,
-        writable.active_id,
-        state.workspace_root,
-    ) catch {};
+    if (state.active_session.?.writable) |*writable| {
+        if (writable.childCapability()) |capability| {
+            _ = legacy_background_migration.migrate(
+                state.alloc,
+                capability,
+                state.cfg.process_provider,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "legacy process migration deferred session={s} err={s}",
+                    .{ writable.active_id, @errorName(err) },
+                );
+            };
+        } else |err| {
+            debug_trace.logf(
+                "session",
+                "legacy process migration unavailable session={s} err={s}",
+                .{ writable.active_id, @errorName(err) },
+            );
+        }
+    }
 }
 
 fn handleLoadFailure(
@@ -944,14 +1012,6 @@ fn handleLoadFailure(
         "session operation=load outcome=failed error={s}",
         .{@errorName(err)},
     );
-    if (err == error.SessionCommitIndeterminate) {
-        try state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Failed to commit session workspace rebind",
-        });
-        state.terminate_connection = true;
-        return;
-    }
     if (err == error.SessionWorkspaceRebindFailed) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
@@ -973,7 +1033,7 @@ fn handleLoadFailure(
     if (err == error.OneOffSessionNotResumable) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "One-off child sessions cannot accept additional prompts",
+            .message = "Subagent child sessions cannot be resumed directly",
         });
     }
     if (err == error.InvalidSessionFormat or
@@ -1013,7 +1073,8 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     };
     defer store.deinit(alloc);
 
-    var page = store.listSessionPage(
+    var page = subagent_resume_admission.listVisiblePage(
+        store,
         alloc,
         if (params.cwd != null) .current_workspace else .all_workspaces,
         params.continuation,
@@ -1129,29 +1190,37 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
     return .{ .updated_at_ms = updated_at_ms, .id = id };
 }
 
-fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
-    const user_text: []const u8 = switch (turn) {
-        .assistant => |a| a.user.text,
-        .background_command => |b| b.user.text,
-        .interrupted => |i| i.user.text,
-        .compacted_summary => |c| c.summary,
-    };
+fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
+    const active = &state.active_session.?;
+    if (active.store) |store| {
+        const Visitor = struct {
+            state: *server.ServerState,
+            alloc: Allocator,
+            session_id: []const u8,
 
-    try sendUserHistoryChunk(state, alloc, session_id, user_text);
+            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, turn);
+            }
+        };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
+        return store.visitConversationHistory(alloc, session_id, &visitor);
+    }
+    for (active.session_rt.agent.history.items) |turn| {
+        try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    }
+}
+
+fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
+    switch (turn) {
+        .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
+        .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
+        .compacted_summary => return,
+    }
 
     switch (turn) {
         .assistant => |assistant| {
             try sendExecutionHistory(state, alloc, session_id, assistant.execution);
             try sendAgentHistoryChunk(state, alloc, session_id, assistant.assistant);
-        },
-        .background_command => |background| {
-            try sendExecutionHistory(state, alloc, session_id, background.execution);
-            if (background.assistant) |assistant| {
-                if (assistant.len > 0) {
-                    try sendAgentHistoryChunk(state, alloc, session_id, assistant);
-                }
-            }
-            try sendAgentHistoryChunk(state, alloc, session_id, "[background command]");
         },
         .interrupted => |i| {
             try sendExecutionHistory(state, alloc, session_id, i.execution);
@@ -1169,13 +1238,68 @@ fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, sessio
     }
 }
 
-fn sendUserHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
+fn sendUserHistoryTurn(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    user: types.UserTurn,
+) !void {
+    var message_id: acp_types.MessageIdBuffer = undefined;
+    const stable_message_id = acp_types.generateMessageId(&message_id);
+    if (user.text.len > 0) {
+        try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, user.text);
+    }
+    for (user.images) |attachment| {
+        var snapshot = image_attachments.loadVerifiedSnapshot(alloc, attachment, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf(
+                "acp",
+                "image history replay omitted id={d} err={s}",
+                .{ attachment.id, @errorName(err) },
+            );
+            var unavailable: [96]u8 = undefined;
+            const notice = try std.fmt.bufPrint(
+                &unavailable,
+                "Image #{d} unavailable",
+                .{attachment.id},
+            );
+            try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, notice);
+            continue;
+        };
+        defer snapshot.deinit(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"sessionId\":");
+        try writeJsonStr(session_id, &out.writer);
+        try out.writer.writeAll(",\"update\":");
+        try acp_types.writeUserImageChunk(
+            &out.writer,
+            stable_message_id,
+            snapshot.media_type,
+            snapshot.bytes,
+        );
+        try out.writer.writeAll("}");
+        try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    }
+}
+
+fn sendUserHistoryChunk(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    message_id: []const u8,
+    text: []const u8,
+) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeUserMessageChunk(&out.writer, text);
+    try acp_types.writeUserMessageChunk(
+        &out.writer,
+        message_id,
+        text,
+    );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -1186,18 +1310,164 @@ fn sendExecutionHistory(
     session_id: []const u8,
     execution: types.ExecutionMemory,
 ) !void {
-    const text = try session_runtime.formatExecutionReplayContext(alloc, execution) orelse return;
-    defer alloc.free(text);
-    try sendAgentHistoryChunk(state, alloc, session_id, text);
+    if (execution.isEmpty()) return;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const frames = try planExecutionReplay(
+        arena_state.allocator(),
+        tool_call_presentation.activeToolRegistry(state),
+        execution,
+    );
+    for (frames) |frame| {
+        switch (frame) {
+            .assistant_text => |text| try sendAgentHistoryChunk(state, alloc, session_id, text),
+            .tool_call => |call| try sendHistoryToolCall(state, alloc, session_id, call),
+        }
+    }
 }
 
-fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
+const ReplayToolCall = struct {
+    id: []const u8,
+    name: []const u8,
+    title: []const u8,
+    kind: acp_types.ToolCallKind,
+    status: acp_types.ToolCallStatus,
+    raw_input: ?std.json.Value,
+    content_text: ?[]const u8,
+};
+
+const ReplayFrame = union(enum) {
+    assistant_text: []const u8,
+    tool_call: ReplayToolCall,
+};
+
+fn replayStatus(result: ?types.PersistedToolResult) acp_types.ToolCallStatus {
+    const r = result orelse return .pending;
+    return switch (r.status) {
+        .success => .completed,
+        .failure => .failed,
+    };
+}
+
+fn findToolResultIndex(results: []const types.PersistedToolResult, call_id: []const u8) ?usize {
+    for (results, 0..) |result, i| {
+        if (std.mem.eql(u8, result.tool_call_id, call_id)) return i;
+    }
+    return null;
+}
+
+fn planToolCallFrame(
+    arena: Allocator,
+    registry: tool_dispatch.Registry,
+    call: types.ToolCall,
+    result: ?types.PersistedToolResult,
+) !ReplayToolCall {
+    const name = tool_call_presentation.acpToolName(call.name);
+    const title = tool_call_presentation.describeToolTitle(registry, arena, call) catch "Tool call";
+    const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(arena, call.name, call.arguments_json);
+    // Parsed with the arena and returned in the frame; no deinit, the caller's
+    // arena frees it in bulk.
+    const parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
+        std.json.Value,
+        arena,
+        masked_arguments,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    return .{
+        .id = call.id,
+        .name = name,
+        .title = title,
+        .kind = tool_call_presentation.mapToolKind(name),
+        .status = replayStatus(result),
+        .raw_input = if (parsed) |p| p.value else null,
+        // Result content follows the same unmasked tool-update content
+        // contract as the live path; only arguments are masked for display
+        // (redactToolArgumentsJson).
+        .content_text = if (result) |r| if (r.output.len > 0)
+            tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
+        else
+            null else null,
+    };
+}
+
+/// Maps a persisted execution memory onto the same session/update frame
+/// sequence the live prompt path emits: interleaved assistant text plus one
+/// tool_call announcement (and final tool_call_update) per tool call.
+/// The returned frames borrow from `execution` and `arena`; the caller owns
+/// the slice and must free it with the arena.
+fn planExecutionReplay(
+    arena: Allocator,
+    registry: tool_dispatch.Registry,
+    execution: types.ExecutionMemory,
+) ![]ReplayFrame {
+    var frames: std.ArrayList(ReplayFrame) = .empty;
+    for (execution.tool_steps) |step| {
+        if (step.assistant) |assistant| {
+            if (assistant.len > 0) try frames.append(arena, .{ .assistant_text = assistant });
+        }
+        const matched = try arena.alloc(bool, step.tool_results.len);
+        @memset(matched, false);
+        for (step.tool_calls) |call| {
+            const result: ?types.PersistedToolResult = if (findToolResultIndex(step.tool_results, call.id)) |i| blk: {
+                matched[i] = true;
+                break :blk step.tool_results[i];
+            } else null;
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, call, result) });
+        }
+        // Results without a surviving call record (e.g. trimmed history) still
+        // replay as completed frames so the transcript stays faithful.
+        for (step.tool_results, 0..) |result, i| {
+            if (matched[i]) continue;
+            const call: types.ToolCall = .{
+                .id = result.tool_call_id,
+                .name = result.tool_name,
+                .arguments_json = "{}",
+            };
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, call, result) });
+        }
+    }
+    return frames.toOwnedSlice(arena);
+}
+
+fn sendHistoryToolCall(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    call: ReplayToolCall,
+) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeAgentMessageChunk(&out.writer, text);
+    try acp_types.writeToolCall(&out.writer, call.id, call.name, call.title, call.kind, .pending, call.raw_input);
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    if (call.status == .pending) return;
+    out.clearRetainingCapacity();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeToolCallUpdate(&out.writer, call.id, call.status, call.content_text);
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
+
+fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
+    var message_id: acp_types.MessageIdBuffer = undefined;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeAgentMessageChunk(
+        &out.writer,
+        acp_types.generateMessageId(&message_id),
+        text,
+    );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -1213,47 +1483,61 @@ fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_i
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-fn buildSlashCommandsJson(alloc: Allocator) ![]u8 {
+pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator) !void {
+    const active = if (state.active_session) |*session| session else return;
+    var metadata = try session_display_metadata.deriveFromHistory(
+        alloc,
+        active.session_rt.agent.history.items,
+    );
+    defer metadata.deinit(alloc);
+    if (active.writable) |*writable| {
+        if (try writable.conversationTitle(alloc)) |title| {
+            metadata.deinit(alloc);
+            metadata = .{ .present = true, .title = title };
+        }
+    }
+    const updated_at_ms = if (active.writable) |*writable|
+        writable.state.updated_at_ms
+    else if (active.wasm_state) |durable|
+        durable.updated_at_ms
+    else
+        io_mod.milliTimestamp();
+    const updated_at = try formatIso8601(alloc, @max(updated_at_ms, 0));
+    defer alloc.free(updated_at);
+
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeSessionInfoUpdate(&out.writer, metadata.title, updated_at);
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
 
-    const commands = [_]struct { name: []const u8, description: []const u8, hint: ?[]const u8 }{
-        .{ .name = "compact", .description = "Compact conversation history", .hint = null },
-        .{ .name = "undo", .description = "Undo last file change", .hint = null },
-        .{ .name = "changes", .description = "Show file changes in this session", .hint = null },
-        .{ .name = "review", .description = "Toggle post-edit review", .hint = null },
-        .{ .name = "clear", .description = "Clear the screen", .hint = null },
-        .{ .name = "reset", .description = "Reset session", .hint = null },
-        .{ .name = "help", .description = "Show available commands", .hint = null },
-        .{ .name = "status", .description = "Show current status", .hint = null },
-        .{ .name = "model", .description = "Switch model", .hint = "model name" },
-        .{ .name = "permissions", .description = "Show permission settings", .hint = null },
-        .{ .name = "allowlist", .description = "Manage persistent allow rules", .hint = "add command \"git *\"" },
-        .{ .name = "rules", .description = "Show active rules", .hint = null },
-        .{ .name = "settings", .description = "Show settings", .hint = null },
-        .{ .name = "credits", .description = "Show credit balance", .hint = null },
-        .{ .name = "mcp", .description = "Show MCP server status", .hint = null },
-        .{ .name = "skills", .description = "Show installed skills", .hint = null },
-        .{ .name = "fast", .description = "Toggle fast mode for supported models", .hint = null },
-    };
+pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator) !void {
+    const active = if (state.active_session) |*session| session else return;
+    const usage = active.session_rt.usage.liveContextSnapshot() orelse return;
+    const provider_bundle = state.cfg.provider_set.select(active.provider);
+    const capabilities = state.capability_resolver.available(
+        active.model,
+        provider_bundle.fallbackModelCapabilities(active.model),
+    );
+    const context_window = capabilities.context_window orelse return;
 
-    try out.writer.writeAll("[");
-    for (commands, 0..) |cmd, i| {
-        if (i > 0) try out.writer.writeAll(",");
-        try out.writer.writeAll("{\"name\":");
-        try writeJsonStr(cmd.name, &out.writer);
-        try out.writer.writeAll(",\"description\":");
-        try writeJsonStr(cmd.description, &out.writer);
-        if (cmd.hint) |hint| {
-            try out.writer.writeAll(",\"input\":{\"hint\":");
-            try writeJsonStr(hint, &out.writer);
-            try out.writer.writeAll("}");
-        }
-        try out.writer.writeAll("}");
-    }
-    try out.writer.writeAll("]");
-
-    return try alloc.dupe(u8, out.writer.buffered());
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeUsageUpdate(
+        &out.writer,
+        usage.used,
+        context_window,
+        usage.complete_cost,
+    );
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
 fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
@@ -1307,12 +1591,20 @@ pub fn writeModelConfigOption(
 pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
+    definitions: []const @import("../core/config/configured_provider.zig").Definition,
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
-    try writeJsonStr(@tagName(current), w);
+    try writeJsonStr(current.label(), w);
     try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
     if (comptime !host_target.is_wasm) {
         try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
+        for (definitions) |definition| {
+            try w.writeAll(",{\"value\":");
+            try writeJsonStr(definition.id, w);
+            try w.writeAll(",\"name\":");
+            try writeJsonStr(definition.id, w);
+            try w.writeAll("}");
+        }
     }
     try w.writeAll("]}");
 }
@@ -1355,6 +1647,108 @@ fn writeModesArray(w: *std.Io.Writer, registry: mode_registry.Registry) !void {
     try w.writeAll("]");
 }
 
+pub const EffortConfigState = struct {
+    efforts: model_capabilities.ReasoningEffortOptions,
+    current: types.ReasoningEffort,
+};
+
+/// Reasoning-effort selector state for the active session, or null when the
+/// active model advertises no effort options (matching the TUI, which hides
+/// the effort picker for those models).
+pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
+    const active = if (state.active_session) |*session| session else return null;
+    const bundle = state.cfg.provider_set.select(active.provider);
+    const capabilities = state.capability_resolver.available(
+        active.model,
+        bundle.fallbackModelCapabilities(active.model),
+    );
+    if (capabilities.reasoning_efforts.len == 0) return null;
+    return .{ .efforts = capabilities.reasoning_efforts, .current = active.effort };
+}
+
+pub fn effortSupportedBy(efforts: model_capabilities.ReasoningEffortOptions, effort: types.ReasoningEffort) bool {
+    if (effort == .auto) return true;
+    for (efforts.slice()) |option| {
+        if (option.eql(effort)) return true;
+    }
+    return false;
+}
+
+pub fn writeEffortConfigOption(
+    w: *std.Io.Writer,
+    efforts: model_capabilities.ReasoningEffortOptions,
+    current: types.ReasoningEffort,
+) !void {
+    try w.writeAll("{\"id\":\"effort\",\"name\":\"Reasoning Effort\",\"description\":\"Controls how much the model thinks before responding\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(current.label(), w);
+    try w.writeAll(",\"options\":[{\"value\":\"auto\",\"name\":\"default\"}");
+    var current_listed = current == .auto;
+    for (efforts.slice()) |effort| {
+        if (effort.eql(current)) current_listed = true;
+        try w.writeAll(",{\"value\":");
+        try writeJsonStr(effort.label(), w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(effort.displayLabel(), w);
+        try w.writeAll("}");
+    }
+    // A persisted effort the active model does not advertise still renders, so
+    // the select never shows a value outside its own option list.
+    if (!current_listed) {
+        try w.writeAll(",{\"value\":");
+        try writeJsonStr(current.label(), w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(current.displayLabel(), w);
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+}
+
+test "writeEffortConfigOption produces thought_level select with auto first" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    });
+    try writeEffortConfigOption(&out.writer, efforts, .literal("high"));
+    const items = out.writer.buffered();
+    try std.testing.expect(std.mem.find(u8, items, "\"id\":\"effort\"") != null);
+    try std.testing.expect(std.mem.find(u8, items, "\"category\":\"thought_level\"") != null);
+    try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"high\"") != null);
+    const auto_index = std.mem.find(u8, items, "\"value\":\"auto\"").?;
+    const low_index = std.mem.find(u8, items, "\"value\":\"low\"").?;
+    try std.testing.expect(auto_index < low_index);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("select", parsed.value.object.get("type").?.string);
+}
+
+test "effortSupportedBy accepts auto and advertised names only" {
+    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    });
+    try std.testing.expect(effortSupportedBy(efforts, .auto));
+    try std.testing.expect(effortSupportedBy(efforts, .literal("high")));
+    try std.testing.expect(!effortSupportedBy(efforts, .literal("max")));
+}
+
+test "writeEffortConfigOption appends an unadvertised current effort" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
+        types.ReasoningEffort.literal("low"),
+    });
+    try writeEffortConfigOption(&out.writer, efforts, .literal("max"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const options = parsed.value.object.get("options").?.array;
+    try std.testing.expectEqual(@as(usize, 3), options.items.len);
+    try std.testing.expectEqualStrings("max", options.items[2].object.get("value").?.string);
+}
+
 test "formatIso8601 produces valid format" {
     const alloc = std.testing.allocator;
     const result = try formatIso8601(alloc, 1700000000000);
@@ -1362,40 +1756,6 @@ test "formatIso8601 produces valid format" {
     try std.testing.expect(result.len > 0);
     try std.testing.expect(std.mem.endsWith(u8, result, "Z"));
     try std.testing.expect(std.mem.find(u8, result, "T") != null);
-}
-
-test "buildSlashCommandsJson produces valid array" {
-    const alloc = std.testing.allocator;
-    const json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(json);
-    try std.testing.expect(json.len > 0);
-    try std.testing.expect(json[0] == '[');
-    try std.testing.expect(json[json.len - 1] == ']');
-    try std.testing.expect(std.mem.find(u8, json, "compact") != null);
-}
-
-test "buildSlashCommandsJson includes all expected commands" {
-    const alloc = std.testing.allocator;
-    const json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(json);
-
-    const expected_commands = [_][]const u8{
-        "compact",   "undo",  "changes",  "review",  "clear",
-        "reset",     "help",  "status",   "model",   "permissions",
-        "allowlist", "rules", "settings", "credits", "mcp",
-        "skills",    "fast",
-    };
-    for (expected_commands) |cmd| {
-        try std.testing.expect(std.mem.find(u8, json, cmd) != null);
-    }
-    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"summary\"") == null);
-}
-
-test "buildSlashCommandsJson includes input hint for model" {
-    const alloc = std.testing.allocator;
-    const json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"input\":{\"hint\":\"model name\"}") != null);
 }
 
 test "formatIso8601 produces known timestamp" {
@@ -1486,6 +1846,41 @@ test "ACP load recognizes the retained active session exactly" {
     ));
 }
 
+test "ACP history excludes typed summaries without filtering original user text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .compacted_summary = .{
+        .summary = @constCast("internal summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } });
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+
+    const original = "Explain <context_handoff> without hiding my question.";
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+        .user = .{ .text = @constCast(original) },
+        .assistant = @constCast("original reply"),
+    } });
+    var file = try tmp.dir.openFile(io_mod.getIo(), "history.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &file, 16 * 1024);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, original) != null);
+    try std.testing.expect(std.mem.find(u8, captured, "original reply") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "internal summary") == null);
+}
+
 test "ACP interrupted history replay hides model-only abort context" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1525,6 +1920,199 @@ test "ACP interrupted history replay hides model-only abort context" {
     try std.testing.expect(std.mem.find(u8, captured, "cancelled") != null);
     try std.testing.expect(std.mem.find(u8, captured, "Interrupted by user after completing") == null);
     try std.testing.expect(std.mem.find(u8, captured, "<turn_aborted>") == null);
+}
+
+fn readCaptured(capture_file: *std.Io.File, alloc: Allocator) ![]u8 {
+    try capture_file.sync(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, capture_file, 1024 * 1024);
+}
+
+test "ACP history replay emits structured tool call frames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_read_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" },
+        .{ .id = "call_write_1", .name = "write_file", .arguments_json = "{\"path\":\"out.txt\",\"content\":\"done\"}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_read_1"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("<content>readme text</content>"),
+            .output_bytes = 27,
+            .stored_output_bytes = 27,
+        },
+        .{
+            .tool_call_id = @constCast("call_write_1"),
+            .tool_name = @constCast("write_file"),
+            .status = .failure,
+            .output = @constCast("permission denied"),
+            .output_bytes = 17,
+            .stored_output_bytes = 17,
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("Let me inspect those files."),
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+        .user = .{ .text = @constCast("read and write") },
+        .assistant = @constCast("All done."),
+        .execution = .{ .tool_steps = steps[0..] },
+    } });
+
+    const captured = try readCaptured(&capture, alloc);
+    defer alloc.free(captured);
+
+    try std.testing.expect(std.mem.find(u8, captured, "Previous tool execution") == null);
+    try std.testing.expect(std.mem.find(u8, captured, "Let me inspect those files.") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "All done.") != null);
+
+    const announce_read = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_read_1\"").?;
+    const announce_write = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_write_1\"").?;
+    const finish_read = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call_read_1\"").?;
+    const finish_write = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call_write_1\"").?;
+    try std.testing.expect(announce_read < finish_read);
+    try std.testing.expect(announce_write < finish_write);
+    try std.testing.expect(announce_read < announce_write);
+
+    try std.testing.expect(std.mem.find(u8, captured, "\"name\":\"read_file\"") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "\"kind\":\"read\"") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "\"rawInput\":{\"path\":\"README.md\"}") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "\"status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "\"status\":\"failed\"") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "readme text") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "permission denied") != null);
+}
+
+test "ACP history replay leaves resultless tool calls pending" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_orphan", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..] }};
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect") },
+        .execution = .{ .tool_steps = steps[0..] },
+    } });
+
+    const captured = try readCaptured(&capture, alloc);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_orphan\"") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call_update\"") == null);
+    try std.testing.expect(std.mem.find(u8, captured, "Previous tool execution") == null);
+}
+
+test "ACP history replay redacts sensitive tool arguments" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_secret", .name = "run_command", .arguments_json = "{\"command\":\"echo ok\",\"api_key\":\"sk-live-secret\"}" },
+    };
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_secret"),
+        .tool_name = @constCast("run_command"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+        .user = .{ .text = @constCast("run it") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } });
+
+    const captured = try readCaptured(&capture, alloc);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, "sk-live-secret") == null);
+    try std.testing.expect(std.mem.find(u8, captured, "[REDACTED]") != null);
+}
+
+test "execution replay plan interleaves assistant text and orphan results" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_a", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_a"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("alpha"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        },
+        .{
+            .tool_call_id = @constCast("call_orphaned"),
+            .tool_name = @constCast("write_file"),
+            .status = .failure,
+            .output = @constCast("denied"),
+            .output_bytes = 6,
+            .stored_output_bytes = 6,
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("working"),
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    const frames = try planExecutionReplay(
+        arena,
+        @import("../builtins/tools.zig").registry,
+        .{ .tool_steps = steps[0..] },
+    );
+    try std.testing.expectEqual(@as(usize, 3), frames.len);
+    try std.testing.expectEqualStrings("working", frames[0].assistant_text);
+    try std.testing.expectEqualStrings("call_a", frames[1].tool_call.id);
+    try std.testing.expectEqual(acp_types.ToolCallStatus.completed, frames[1].tool_call.status);
+    try std.testing.expectEqual(acp_types.ToolCallKind.read, frames[1].tool_call.kind);
+    try std.testing.expectEqualStrings("alpha", frames[1].tool_call.content_text.?);
+    try std.testing.expectEqualStrings("call_orphaned", frames[2].tool_call.id);
+    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, frames[2].tool_call.status);
+    try std.testing.expect(frames[2].tool_call.raw_input != null);
 }
 
 test "ACP load maps one-off child denial to invalid params" {
@@ -1571,7 +2159,7 @@ test "ACP load maps one-off child denial to invalid params" {
     try std.testing.expect(std.mem.find(
         u8,
         captured,
-        "One-off child sessions cannot accept additional prompts",
+        "Subagent child sessions cannot be resumed directly",
     ) != null);
 }
 
@@ -1931,6 +2519,15 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
 
+        _ = try new_writable.appendEvent(arena, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("remember this") },
+                .assistant = @constCast("retained answer"),
+            } },
+        } }, io_mod.milliTimestamp());
         const session_id = try alloc.dupe(u8, new_active.session_id);
         defer alloc.free(session_id);
         try server.releaseActiveSession(&state);
@@ -1952,6 +2549,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
 
         const loaded_active = &state.active_session.?;
         const loaded_writable = &loaded_active.writable.?;
+        try std.testing.expectEqual(@as(usize, 1), loaded_active.session_rt.historyLen());
+        try std.testing.expectEqual(@as(usize, 0), loaded_writable.state.history.len);
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
             loaded_active.mode,

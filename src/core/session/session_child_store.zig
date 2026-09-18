@@ -502,6 +502,19 @@ const CapabilityImpl = struct {
 pub const SessionChildCapability = struct {
     impl: *CapabilityImpl,
 
+    pub fn duplicate(
+        self: *const SessionChildCapability,
+        alloc: Allocator,
+    ) !SessionChildCapability {
+        return initWithOptions(
+            alloc,
+            self.impl.session_dir.dir,
+            self.impl.display_session_path,
+            self.impl.mode,
+            .{},
+        );
+    }
+
     pub fn init(
         alloc: Allocator,
         session_dir: std.Io.Dir,
@@ -538,6 +551,37 @@ pub const SessionChildCapability = struct {
             route.setPermissions(io_mod.getIo(), private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
+        return initOpenedLegacyRoute(alloc, route, route_path, kind, mode);
+    }
+
+    /// Reads only an existing control route; legacy session parents need not
+    /// have acquired current-format directory permissions before discovery.
+    pub fn initLegacySubagentControl(
+        alloc: Allocator,
+        session_dir: std.Io.Dir,
+        display_session_path: []const u8,
+    ) !?SessionChildCapability {
+        var route = session_dir.openDir(io_mod.getIo(), "subagent", .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+            else => return err,
+        };
+        errdefer route.close(io_mod.getIo());
+        const display = try std.fs.path.join(alloc, &.{ display_session_path, "subagent" });
+        defer alloc.free(display);
+        return try initOpenedLegacyRoute(alloc, route, display, .subagent_control, .read_only);
+    }
+
+    fn initOpenedLegacyRoute(
+        alloc: Allocator,
+        route: std.Io.Dir,
+        route_path: []const u8,
+        kind: ManagedChildKind,
+        mode: Mode,
+    ) !SessionChildCapability {
         try verifyPrivateDirectory(route);
 
         var retained = try route.openDir(io_mod.getIo(), ".", .{
@@ -981,7 +1025,9 @@ pub const SessionChildCapability = struct {
                 else => return err,
             };
             try verifyPrivateStat(file_stat);
-            try names.append(alloc, try alloc.dupe(u8, entry.name));
+            const owned_name = try alloc.dupe(u8, entry.name);
+            errdefer alloc.free(owned_name);
+            try names.append(alloc, owned_name);
         }
         return .{
             .alloc = alloc,
