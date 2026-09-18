@@ -104,9 +104,12 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 
 ## Experimental model routing
 
-The [experimental Jev routing example](examples/jev-routing/README.md) uses AI
-Gateway to classify a task and launch `fx ask` with a selected model. It is an
-opt-in client-side experiment; normal fx model selection is unchanged.
+Select `jev/auto` with `--model` or `FX_MODEL` to route each new prompt through
+Jev on AI Gateway. Enable `FX_EXPERIMENT_JEV_SUBAGENT_ROUTING=1` to route new
+child assignments independently. Each assignment keeps its selected model
+through tool calls; a concrete model choice stays pinned. See the
+[experimental routing guide](examples/jev-routing/README.md) for controls,
+fallbacks, telemetry and limitations.
 
 ## Credits
 

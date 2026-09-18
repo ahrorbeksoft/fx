@@ -4,6 +4,7 @@ const skill_contract = @import("../../skills/skill_contract.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
+const jev_routing = @import("jev_routing.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
@@ -5183,7 +5184,7 @@ fn processQueuedPromptInner(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
-    config: Config,
+    borrowed_config: Config,
     borrowed_job: QueuedPrompt,
     finalization: *TurnFinalizationGuard,
     agent: *runtime_agent.Agent,
@@ -5192,6 +5193,7 @@ fn processQueuedPromptInner(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var job = borrowed_job;
+    var config = borrowed_config;
     job.account_id = if (borrowed_job.account_id) |account_id|
         try arena.dupe(u8, account_id)
     else
@@ -5265,6 +5267,80 @@ fn processQueuedPromptInner(
     var completed_tool_names: std.ArrayList([]u8) = .empty;
     defer completed_tool_names.deinit(arena);
     var interrupted_persisted = false;
+
+    if (jev_routing.isAuto(job.model)) {
+        if (job.provider != .gateway) return error.JevRoutingRequiresGateway;
+        var route_history: std.ArrayList(ChatMessage) = .empty;
+        try session_runtime.appendActiveContextHistoryChatMessages(arena, &route_history, job.history, 0);
+        var objective: []const u8 = job.root_user_intent_context;
+        if (objective.len == 0) for (route_history.items) |message| {
+            if (message.role == .user) {
+                objective = message.content orelse "";
+                break;
+            }
+        };
+        var previous: ?[]const u8 = agent.routed_model;
+        if (previous == null) {
+            var i = job.history.len;
+            while (i > 0) {
+                i -= 1;
+                if (types.historyTurnSummary(job.history[i])) |summary| {
+                    if (summary.jev_model) |key| {
+                        previous = jev_routing.modelId(key);
+                        break;
+                    }
+                }
+                if (job.history[i] == .assistant) {
+                    if (job.history[i].assistant.provider_replay) |replay| {
+                        previous = replay.source.model;
+                        break;
+                    }
+                }
+            }
+        }
+        if (job.recovery_checkpoint) |checkpoint| {
+            job.model = checkpoint.authority.model;
+        } else if (job.delivery.isContinuation()) {
+            job.model = @constCast(previous orelse return error.RoutingContinuationModelUnavailable);
+        } else {
+            // Conservative byte upper bound over all known execution context,
+            // independently of the small classifier packet. The regular request
+            // capacity gate still checks the final serialized provider request.
+            const serialized_history = try std.json.Stringify.valueAlloc(arena, route_history.items, .{});
+            const serialized_tools = try std.json.Stringify.valueAlloc(arena, config.advertised_functions, .{});
+            const required: u64 = 32_768 +| serialized_history.len +| serialized_tools.len +|
+                job.prompt.len +| config.system_prompt.len +| config.host_instructions.len +|
+                job.context_snapshot.modelVisibleBytes().len +| config.custom_tool_guidance.len;
+            var has_images = job.images.len > 0 or job.authorized_image_catalog.len > 0;
+            for (route_history.items) |message| has_images = has_images or message.images.len > 0;
+            const decision = try jev_routing.route(arena, .{
+                .prompt = job.prompt,
+                .history = route_history.items,
+                .objective = objective,
+                .role = config.routing_role,
+                .origin = @tagName(config.origin),
+                .previous_model = previous,
+                .required_context_tokens = required,
+                .images = has_images,
+                .tools = config.advertised_functions.len > 0,
+                .effort = config.effort,
+                .fast_mode = config.fast_mode,
+                .api_key = job.api_key,
+                .team = job.gateway_team,
+                .cancel_flag = config.cancel_flag,
+                .allowed_models = io_mod.getenv("FX_JEV_ALLOWED_MODELS"),
+                .trace = finish_trace.ctx,
+            }, deps);
+            job.model = @constCast(decision.model);
+            agent.routed_model = decision.model;
+            try deps.pushContextNotice(try std.fmt.allocPrint(arena, "Jev selected {s} for this {s} assignment ({s}).", .{ decision.model, @tagName(config.origin), @tagName(decision.reason) }));
+        }
+        config.model_prompt_overlay = if (config.model_prompt_overlay_fn) |overlay| overlay(job.model) else null;
+        summary_accumulator.jev_model = jev_routing.modelKey(job.model);
+        agent.routed_model = if (summary_accumulator.jev_model) |key| jev_routing.modelId(key) else null;
+    } else {
+        agent.routed_model = null;
+    }
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
 
@@ -10239,6 +10315,7 @@ fn processQueuedPromptLoop(
                         .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                         .hooks = deps,
                         .turn_id = turn_id,
+                        .execution_model = if (agent.routed_model != null) job.model else null,
                         .root_user_intent_context = parallel_execution_root_user_context,
                         .current_turn_messages = within_turn_suffix.items,
                         .session_grants = local_grants.items,
@@ -11559,6 +11636,7 @@ fn processQueuedPromptLoop(
                 .authority = execution_authority,
                 .credential = activeCredentialLease(active_api_key, job),
                 .permission_mode = action_permission_mode,
+                .execution_model = if (agent.routed_model != null) job.model else null,
                 .root_user_intent_context = tool_execution_root_user_context,
                 .root_user_messages = &.{},
                 .root_user_evidence_complete = true,

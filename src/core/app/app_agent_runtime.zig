@@ -1253,6 +1253,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_set = providers,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
+                .model_prompt_overlay_fn = prompt_policy.model_prompt_overlay_fn,
                 .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 .advertised_tool_names = child_projection.advertised_names,
                 .advertised_functions = child_projection.advertised_functions,
@@ -1292,6 +1293,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
+                .model_prompt_overlay_fn = prompt_policy.model_prompt_overlay_fn,
                 .skill_catalog = catalog,
                 .skill_bindings = bindings,
                 .gateway_retry_count = gateway_retry_count,
