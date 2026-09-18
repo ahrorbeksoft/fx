@@ -1,9 +1,0 @@
-{
-  "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
-  "nativeSourceSha256": "3900625d377760958a8c4c3c0bc3b9e66026dc5f1f57b2bcf847d512673df905",
-  "zigVersion": "0.16.0",
-  "target": "x86_64-linux-musl",
-  "optimize": "ReleaseSafe",
-  "binarySha256": "4281594d49c862777e9841fcc3fcb89d4e794101d5b4e49ea2f246ff2541bd67",
-  "note": "Built from the modified working tree on the base commit. Embedded git version identifies the base; the artifact hash identifies the experiment binary."
-}

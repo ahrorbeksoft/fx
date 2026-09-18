@@ -113,5 +113,6 @@ compaction through `typesafe-ai/jev` on AI Gateway. The fast path evaluates olde
 tool results, preserves original user messages and retrievable source artifacts,
 and falls back to the existing summarizer when it cannot safely fit the handoff.
 It requires a Gateway credential and is off by default. Performance and quality
-are experimental. See [the hosted experiment agent](harborhub-agent/README.md)
-for the routing policy, benchmark controls and usage-accounting limits.
+are experimental. Jev evaluation usage is recorded separately; total billing
+remains incomplete where Gateway does not return a generation identity. This
+feature does not change model selection.
