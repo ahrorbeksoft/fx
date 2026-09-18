@@ -114,3 +114,14 @@ fallbacks, telemetry and limitations.
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+### Experimental Jev compaction
+
+Development builds can set `FX_EXPERIMENT_JEV_COMPACTION=1` to try extractive
+compaction through `typesafe-ai/jev` on AI Gateway. The fast path evaluates older
+tool results, preserves original user messages and retrievable source artifacts,
+and falls back to the existing summarizer when it cannot safely fit the handoff.
+It requires a Gateway credential and is off by default. Performance and quality
+are experimental. Jev evaluation usage is recorded separately; total billing
+remains incomplete where Gateway does not return a generation identity. This
+feature does not change model selection.
