@@ -38,7 +38,7 @@ of model success. Classification thresholds are 0.6 for family and 0.75 for
 requirements.
 
 Capability checks use the live catalog, current tools/images/effort/fast mode and
-a conservative bound over the full known execution context. The normal provider
+an estimate of the full known execution context plus a 32K-token reserve. The normal provider
 request-capacity check remains authoritative. Unknown capabilities are ineligible.
 `FX_JEV_ALLOWED_MODELS` restricts candidates using comma-separated exact IDs;
 an empty value allows none. Account/provider access must also permit the models.
@@ -47,7 +47,7 @@ The commands above disable fast mode to measure model choice independently.
 On low confidence, unavailable evaluation or invalid answers, retain the previous
 eligible routed model when available, otherwise Kimi. A missing eligible fallback
 fails closed. Evaluation has a ten-second maximum deadline and honors cancellation.
-Paused recovery reuses its recorded model without reclassification. Routing
+Paused recovery and manual compaction reuse the selected model without reclassification. Routing
 choices are saved in optional turn metadata so resumed prompts preserve continuity.
 Sessions created with this experiment require a build that understands that metadata.
 
