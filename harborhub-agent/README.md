@@ -30,11 +30,21 @@ All arms run the same 89 Terminal-Bench 2.1 revision 6 tasks, one attempt per ta
 Jev compaction does not provide evidence about compaction efficacy. The routing
 policy is an experimental requirements rubric, not a learned success predictor.
 
-Use hosted `credential_mode: direct` with the stored `AI_GATEWAY_API_KEY` selected.
+Use hosted `credential_mode: direct` with `AI_GATEWAY_API_KEY` selected. The v4
+submission supplies a dedicated personal-team key through Harbor's job-scoped
+`job_secrets`, which takes precedence over the organization's stored key. The
+organization's reusable credential is unchanged; the personal key is never
+written into the reviewed job JSON or source repository.
 The generic Harbor inference proxy is not assumed to support Gateway's typed
 Jev evaluation protocol. A separate hello-world smoke gates live evaluation and
 all three candidate models before a full matrix. Security-policy failures block
 launch; no provider allowlist is changed by this adapter.
+
+A `403` with `code=no_providers_available` means provider filtering rejected all
+candidates. A team owner must verify the Provider Allowlist in AI Gateway
+Settings and enable TypeSafe AI when approved. The preflight recognizes both
+Gateway's top-level `type` error field and nested machine codes, while keeping
+provider error text and credentials out of artifacts.
 
 Harbor resolves the package and its locked Python runtime from a pinned GitHub
 commit. Local tests do not upload or launch anything. The binary source commits

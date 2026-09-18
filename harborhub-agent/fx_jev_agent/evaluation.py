@@ -12,6 +12,28 @@ CONFIG = Path(__file__).resolve().parent.parent / "config"
 POLICY = json.loads((CONFIG / "policy.json").read_text())
 QUESTIONS = json.loads((CONFIG / "questions.json").read_text())
 EVALUATION_URL = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
+SAFE_ERROR_CODES = frozenset({
+    "no_providers_available", "permission_denied", "unauthorized",
+    "model_not_found", "rate_limit_exceeded",
+})
+
+
+def _gateway_error_code(body: bytes) -> str:
+    try:
+        detail = json.loads(body)
+    except (ValueError, TypeError):
+        return "unknown"
+    if not isinstance(detail, dict):
+        return "unknown"
+    # Gateway's provider allowlist denial has a top-level `type` and a string
+    # `error`. Other endpoints wrap machine codes in an `error` object.
+    for envelope in (detail.get("error"), detail):
+        if isinstance(envelope, dict):
+            for field in ("type", "code"):
+                candidate = envelope.get(field)
+                if isinstance(candidate, str) and candidate in SAFE_ERROR_CODES:
+                    return candidate
+    return "unknown"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -39,15 +61,8 @@ def evaluate(state: str, questions: dict = QUESTIONS) -> dict:
             body = response.read(2_000_001)
     except urllib.error.HTTPError as error:
         # Keep only known machine error codes; never echo provider error text.
-        code = "unknown"
-        try:
-            detail = json.loads(error.read(4096))
-            nested = detail.get("error", detail) if isinstance(detail, dict) else None
-            candidate = nested.get("code") if isinstance(nested, dict) else None
-            if candidate in {"no_providers_available", "permission_denied", "unauthorized", "model_not_found", "rate_limit_exceeded"}:
-                code = candidate
-        except (ValueError, TypeError):
-            pass
+        with error:
+            code = _gateway_error_code(error.read(4096))
         raise RuntimeError(f"Gateway evaluation denied: HTTP {error.code}, code={code}") from None
     if len(body) > 2_000_000:
         raise ValueError("evaluation_response_too_large")
