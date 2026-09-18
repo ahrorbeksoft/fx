@@ -122,6 +122,8 @@ test.skipIf(!tmuxAvailable())("Jev native transport commits extractive memory an
   }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
   const evaluator = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     expect(request.headers.get("ai-model-id")).toBe("typesafe-ai/jev");
+    expect(request.headers.get("authorization")).toBe("Bearer synthetic-compaction-evaluation");
+    expect(request.headers.get("x-vercel-ai-gateway-team")).toBe("personal-evaluation-team");
     const body = await request.json() as any;
     expect(body.providerOptions.gateway.zeroDataRetention).toBe(true);
     expect(body.state).toContain("EXACT_JEV_RESULT_1");
@@ -132,7 +134,7 @@ test.skipIf(!tmuxAvailable())("Jev native transport commits extractive memory an
   let passed = false;
   try {
     tui = await TmuxSession.create({ cwd, env: {
-      HOME: home, TMPDIR: root, AI_GATEWAY_API_KEY: "synthetic-jev", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+      HOME: home, TMPDIR: root, AI_GATEWAY_API_KEY: "synthetic-jev", FX_JEV_GATEWAY_API_KEY: "synthetic-compaction-evaluation", FX_JEV_GATEWAY_TEAM: "personal-evaluation-team", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
       FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_PERMISSION_MODE: "full-access",
       FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
@@ -164,6 +166,9 @@ test.skipIf(!tmuxAvailable())("Jev native transport commits extractive memory an
     expect(readFileSync(log).subarray(0, before.length).equals(before)).toBe(true);
     await tui.waitForComposer(20000);
     await tui.sendText("Continue after Jev compaction."); await tui.waitForText("JEV_VISIBLE_DONE_20", 20000);
+    expect(gateway.requests.every(r => r.headers.get("authorization") === "Bearer synthetic-jev")).toBe(true);
+    expect(gateway.requests.every(r => r.headers.get("x-vercel-ai-gateway-team") !== "personal-evaluation-team")).toBe(true);
+    expect(readFileSync(join(root, "trace.log"), "utf8")).not.toContain("synthetic-compaction-evaluation");
     passed = true;
   } finally {
     await tui?.kill(); gateway.stop(); evaluator.stop(true);
