@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .routing import POLICY, evaluate, route
+from .evaluation import POLICY, evaluate
 
 from acp import (
     PROTOCOL_VERSION,
@@ -59,14 +59,39 @@ def selected_build() -> dict:
     expected = {
         "FX_EXPERIMENT_X9_EDITOR": "patch_v3" if variant == "patch-retry" else "control",
         "FX_EXPERIMENT_X9_PROVIDER_RETRY": "adaptive_v1" if variant == "patch-retry" else "control",
-        "FX_EXPERIMENT_JEV_COMPACTION": "1" if variant == "compaction" else "0",
+        "FX_EXPERIMENT_JEV_COMPACTION": "1" if variant in {"compaction", "both"} else "0",
+        "FX_EXPERIMENT_JEV_ROUTING": "1" if variant in {"routing", "both"} else "0",
+        "FX_EXPERIMENT_JEV_SUBAGENT_ROUTING": "1" if variant in {"routing", "both"} else "0",
     }
     if any(os.environ.get(key, default) != value for key, value in expected.items()
-           for default in ["0" if key.endswith("COMPACTION") else "control"]):
+           for default in ["control" if key.startswith("FX_EXPERIMENT_X9_") else "0"]):
         raise ValueError("benchmark_switches_do_not_match_binary")
     if variant == "patch-retry" and os.environ.get("FX_EXPERIMENT_JEV_ROUTING", "0") != "0":
         raise ValueError("patch_retry_arm_must_not_enable_jev_routing")
     return {**build, "variant": variant}
+
+
+def routing_trace(trace: str) -> tuple[list[dict], int]:
+    """Parse only the native routing protocol; malformed events stay visible."""
+    import re
+    result, errors = [], 0
+    for line in trace.splitlines():
+        if "event=jev_route " not in line:
+            continue
+        try:
+            item = json.loads(line.split("data=", 1)[1])
+            if item.get("policy") != "jev-assignment-v2" or item.get("origin") not in {"root", "subagent"}:
+                raise ValueError("unknown routing contract")
+            decision = item.get("decision", {})
+            if decision.get("model") not in {m["id"] for m in POLICY["models"]}:
+                raise ValueError("unknown selected model")
+            item["turnId"] = int(re.search(r"\bturn_id=(\d+)", line).group(1))
+            child = re.search(r"\bsubagent_id=(\d+)", line)
+            item["subagentId"] = int(child.group(1)) if child else None
+            result.append(item)
+        except (ValueError, KeyError, IndexError, AttributeError, TypeError):
+            errors += 1
+    return result, errors
 
 
 class FxAskAgent(Agent):
@@ -274,7 +299,7 @@ class FxAskAgent(Agent):
             probes = []
             for candidate in POLICY["models"]:
                 probe = await asyncio.create_subprocess_exec(
-                    str(binary), "ask", "--json", "--model", candidate["id"], "--effort", "high", "--", "Reply with OK. Do not use tools.",
+                    str(binary), "ask", "--json", "--model", candidate["id"], "--effort", "high", "--no-fast", "--", "Reply with OK. Do not use tools.",
                     cwd=session["cwd"], stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
@@ -290,16 +315,8 @@ class FxAskAgent(Agent):
             (FX_LOG.parent / "jev-preflight.json").write_text(json.dumps({"boolean": boolean_probe, "models": probes}, indent=2))
             session["preflight"] = True
         model = session["model"].removeprefix("vercel_ai_gateway/")
-        if "decision" not in session:
-            if os.environ.get("FX_EXPERIMENT_JEV_ROUTING") == "1":
-                decision = await asyncio.to_thread(route, instruction)
-                if os.environ.get("FX_JEV_REQUIRE_EVALUATION") == "1" and decision["error"]:
-                    raise RuntimeError("Jev smoke evaluation failed; do not launch the matrix")
-            else:
-                decision = {"model": model, "reason": "routing_disabled", "classification": None}
-            session["decision"] = decision
-            (FX_LOG.parent / "jev-routing.json").write_text(json.dumps(decision, indent=2))
-        model = session["decision"]["model"]
+        if os.environ.get("FX_EXPERIMENT_JEV_ROUTING") == "1":
+            model = "jev/auto"
         env = dict(os.environ)
         env.update(
             {
@@ -307,11 +324,23 @@ class FxAskAgent(Agent):
                 "FX_MODEL": model,
                 "FX_SOUND": "0",
                 "FX_TRACE_LOG": str(FX_TRACE_LOG),
-                "FX_TRACE_SCOPES": "quality,gateway,agent,history,tool,context_compaction",
+                "FX_TRACE_SCOPES": "quality,gateway,agent,history,tool,subagent,context_compaction",
             }
         )
 
-        command = [str(binary), "ask", "--yolo", "--json", "--model", model, "--effort", "high"]
+        if os.environ.get("FX_BENCH_MULTI_PROMPT_PROBE") == "1" and not session.get("multi_prompt_probe"):
+            from .multi_prompt_probe import run as run_probe
+            probe = await run_probe(binary, env, FX_LOG.parent, self._processes, session_id)
+            probe_trace = FX_LOG.parent / "multi-prompt-trace.log"
+            probe_routes, probe_errors = routing_trace(probe_trace.read_text() if probe_trace.exists() else "")
+            probe["routingDecisions"] = probe_routes
+            probe["routingParseErrors"] = probe_errors
+            probe["rootDecisions"] = sum(r["origin"] == "root" for r in probe_routes)
+            probe["childDecisions"] = sum(r["origin"] == "subagent" for r in probe_routes)
+            (FX_LOG.parent / "multi-prompt-probe.json").write_text(json.dumps(probe, indent=2))
+            session["multi_prompt_probe"] = True
+
+        command = [str(binary), "ask", "--yolo", "--json", "--model", model, "--effort", "high", "--no-fast"]
         if saved := session.get("fx_session"):
             command.extend(["--resume-id", saved])
         command.extend(["--", instruction])
@@ -336,6 +365,12 @@ class FxAskAgent(Agent):
         FX_STDERR_LOG.write_text(stderr, encoding="utf-8")
 
         trace = FX_TRACE_LOG.read_text() if FX_TRACE_LOG.exists() else ""
+        routes, route_errors = routing_trace(trace)
+        (FX_LOG.parent / "jev-routing.json").write_text(json.dumps({
+            "version": 2, "mode": "native_assignments", "decisions": routes,
+            "parseErrors": route_errors,
+            "enabled": os.environ.get("FX_EXPERIMENT_JEV_ROUTING") == "1",
+        }, indent=2))
         (FX_LOG.parent / "jev-telemetry.json").write_text(json.dumps({
             "binarySha256": binary_sha256, "model": model,
             "variant": build["variant"], "sourceCommit": build["sourceCommit"],
@@ -344,6 +379,13 @@ class FxAskAgent(Agent):
             "patchExperimentObserved": "event=x9_editor editor=patch_v3" in trace,
             "retryExperimentObserved": "event=x9_provider_retry provider_retry=adaptive_v1" in trace,
             "routingEnabled": os.environ.get("FX_EXPERIMENT_JEV_ROUTING") == "1",
+            "childRoutingEnabled": os.environ.get("FX_EXPERIMENT_JEV_SUBAGENT_ROUTING") == "1",
+            "routingPolicy": "jev-assignment-v2",
+            "rootRoutingDecisions": sum(r["origin"] == "root" for r in routes),
+            "childRoutingDecisions": sum(r["origin"] == "subagent" for r in routes),
+            "routingEvaluations": trace.count("event=jev_route_evaluation "),
+            "completedRoutingEvaluations": sum(r["decision"].get("evaluated") is True for r in routes),
+            "routingParseErrors": route_errors,
             "compactionEnabled": os.environ.get("FX_EXPERIMENT_JEV_COMPACTION") == "1",
             "evaluations": trace.count("event=jev_evaluated"),
             "extractiveCompactions": trace.count("event=jev_completed"),
@@ -360,6 +402,10 @@ class FxAskAgent(Agent):
                         shutil.copyfile(usage_path, FX_LOG.parent / "fx-usage.json")
             except json.JSONDecodeError:
                 pass
+        if os.environ.get("FX_JEV_REQUIRE_EVALUATION") == "1":
+            roots = [r for r in routes if r["origin"] == "root"]
+            if route_errors or not roots or not all(r["decision"].get("evaluated") and r["decision"].get("reason") == "classified" for r in roots):
+                raise RuntimeError("Native Jev routing smoke did not classify every root prompt")
         if process.returncode != 0:
             detail = stderr.strip() or stdout.strip() or "no diagnostic output"
             raise RuntimeError(

@@ -1,14 +1,12 @@
 {
-  "sourceCommit": "daa84139d73fe6fa4cf70169bbe797c87ec5083e",
-  "path": "examples/jev-routing",
+  "sourceCommit": "8ebeb2bebe17dcebfa637fe54f39b4190c0500d9",
+  "mode": "native-root-and-child-assignments",
+  "policy": "jev-assignment-v2",
   "files": {
-    "config/model-catalog.json": "265b0845c66b897c832c2e17e6c26be07fb2d976e1bd6990b2c6a0501d6578c6",
-    "config/policy.json": "4f3ba6cfd53e2bf6b8b8f82d1912f6738a234d8676f0e9cbb72fab19f1cf86e9",
-    "config/taxonomy.json": "a27b8f0bf2b9b084f35ad32253ed81feaf495c19585d9839d3ae5f142f84b76d",
-    "src/classifier.mjs": "f2ee452b5d2295521541f67ee8703d05cd07d69a666792928c30cb7b1b79a4b1",
-    "src/cli.mjs": "83a94458b6c3225cf2e0f7ba4c543569697fc845944cb05440b94a6c9f2bce9c",
-    "src/gateway.mjs": "8e7c222c5dad3a1910be5faf87fa62e40000ba3580ee6fd2f454916dee336e77",
-    "src/router.mjs": "c2ff93afd60b61240be5eaf03680c227264666bdbad96fdb5d557ab5f66c8917",
-    "test/router.test.mjs": "16700bde1c85b3ab596ccbfcc258c952fc6058f3f4c1982133a5c9e22fbe38e6"
+    "src/core/agent/runtime/jev_routing.zig": "0a43062454e24552766f0a274abf6e1a08e9523f86291b500034d0ad17aa79ce",
+    "src/core/agent/runtime/jev_taxonomy.json": "a27b8f0bf2b9b084f35ad32253ed81feaf495c19585d9839d3ae5f142f84b76d",
+    "src/core/agent/runtime/orchestrator.zig": "ad8904f604f3c3472c81d9bdf0232aaa2a473b380f88dc446f2e0a450f87159a",
+    "src/core/agent/evaluation_provider.zig": "752842822319455d79f3728cfe35b68624cd440e5999bf815899aefa271d464f",
+    "src/gateway/jev.zig": "082f893b246f48eff734fd3d04d7bb7902696cb748774ca08f5e129267cfc414"
   }
 }

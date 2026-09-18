@@ -7,23 +7,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from fx_jev_agent.routing import POLICY, choice, select
-from fx_jev_agent.__main__ import selected_build
+from fx_jev_agent.evaluation import POLICY, evaluate
+from fx_jev_agent.__main__ import selected_build, routing_trace
 from unittest.mock import patch
 
 
 class AdapterTests(unittest.TestCase):
-    def test_rejects_invalid_probabilities(self):
-        for p in [float('nan'), -1, 2, True]:
-            with self.assertRaises(ValueError):
-                choice({'type': 'choice', 'choice': 'a', 'probabilities': {'a': p}}, ['a'])
+    def test_preflight_requires_direct_credentials(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'credential_missing'):
+                evaluate('preflight', {})
 
-    def test_explicit_and_capability_constraints(self):
-        self.assertEqual(select(None, requirements={'explicitModel': POLICY['defaultModel']})['reason'], 'explicit_model')
-        with self.assertRaises(ValueError):
-            select(None, requirements={'contextTokens': 2_000_000})
-        with self.assertRaises(ValueError):
-            select(None, requirements={'allowedModels': []})
+    def test_native_routing_trace_keeps_child_identity_and_malformed_events(self):
+        data = {'policy':'jev-assignment-v2', 'origin':'subagent', 'decision':{'model':POLICY['defaultModel'], 'evaluated':True}}
+        trace = '1 [quality] event=jev_route turn_id=7 subagent_id=3 data=' + json.dumps(data)
+        routes, errors = routing_trace(trace + '\n2 event=jev_route turn_id=9 data=broken')
+        self.assertEqual(errors, 1)
+        self.assertEqual(routes[0]['turnId'], 7)
+        self.assertEqual(routes[0]['subagentId'], 3)
 
     def test_binary_variant_rejects_wrong_experiment_switches(self):
         with patch.dict(os.environ, {'FX_BENCH_VARIANT':'patch-retry'}, clear=True):
@@ -45,6 +46,17 @@ class AdapterTests(unittest.TestCase):
         response = json.loads(result.stdout.splitlines()[0])
         self.assertEqual(response['result']['agentInfo']['name'], 'fx-jev-matrix')
         self.assertNotIn('error', response)
+
+    def test_native_variants_require_both_root_and_child_routing(self):
+        for variant in ['routing', 'both']:
+            switches = {'FX_BENCH_VARIANT':variant, 'FX_EXPERIMENT_JEV_ROUTING':'1',
+                        'FX_EXPERIMENT_JEV_SUBAGENT_ROUTING':'1',
+                        'FX_EXPERIMENT_JEV_COMPACTION':str(int(variant == 'both'))}
+            with patch.dict(os.environ, switches, clear=True):
+                self.assertEqual(selected_build()['variant'], variant)
+            with patch.dict(os.environ, {**switches, 'FX_EXPERIMENT_JEV_SUBAGENT_ROUTING':'0'}, clear=True):
+                with self.assertRaisesRegex(ValueError, 'switches'):
+                    selected_build()
 
 
 if __name__ == '__main__':

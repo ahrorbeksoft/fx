@@ -32,5 +32,29 @@
     "zigVersion": "0.16.0",
     "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
     "status": "built-clean-source"
+  },
+  "routing": {
+    "file": "fx-routing",
+    "sourceCommit": "8ebeb2bebe17dcebfa637fe54f39b4190c0500d9",
+    "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "sha256": "150da6970513ee9f258e5c5663204e8f720b0111284222c612b3f3d241f6b651",
+    "bytes": 12338632,
+    "zigVersion": "0.16.0",
+    "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
+    "status": "built-clean-source"
+  },
+  "both": {
+    "file": "fx-both",
+    "sourceCommit": "8dc83737eed5cf2356c2319a79a307a704ecf880",
+    "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "sha256": "4502c5e456f91b234e6a901fa40b0db42d2f6c243702899b908f0cb0bbf69810",
+    "bytes": 12350712,
+    "zigVersion": "0.16.0",
+    "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
+    "status": "built-clean-source",
+    "featureCommits": {
+      "routing": "8ebeb2bebe17dcebfa637fe54f39b4190c0500d9",
+      "compaction": "2d817e68a868200453015b496b779f32f84012fd"
+    }
   }
 }
