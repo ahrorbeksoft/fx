@@ -111,6 +111,15 @@ checks permission for every affected path, including move destinations. After
 a failed file mutation, later queued file edits wait for the model to observe
 the failure. This experiment has not been re-benchmarked on current main.
 
+## Experimental adaptive retry
+
+Development builds can set `FX_EXPERIMENT_X9_PROVIDER_RETRY=adaptive_v1` for the
+experimental provider retry policy in `fx ask`: at most three billable attempts
+per response with 30/60/120-second response-head deadlines. Exhaustion saves a
+paused recovery checkpoint. The control arm retains main's patient recovery and
+ten-minute mid-stream stall window; connectivity and liveness probes remain
+non-billable recovery. The experiment has not been re-benchmarked on current main.
+
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
