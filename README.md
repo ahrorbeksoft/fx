@@ -105,3 +105,13 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+### Experimental Jev compaction
+
+Development builds can set `FX_EXPERIMENT_JEV_COMPACTION=1` to try extractive
+compaction through `typesafe-ai/jev` on AI Gateway. The fast path evaluates older
+tool results, preserves original user messages and retrievable source artifacts,
+and falls back to the existing summarizer when it cannot safely fit the handoff.
+It requires a Gateway credential and is off by default. Performance and quality
+are experimental. See [the hosted experiment agent](harborhub-agent/README.md)
+for the routing policy, benchmark controls and usage-accounting limits.
