@@ -5,7 +5,6 @@ const skill_invocation = @import("../../skills/skill_invocation.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const jev_routing = @import("jev_routing.zig");
-const token_estimate = @import("../../shared/token_estimate.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
@@ -5289,14 +5288,7 @@ fn processQueuedPromptInner(
             // Estimate all known execution context independently of the small
             // classifier packet, with room for overlays and output. The regular
             // capacity gate still checks the final serialized provider request.
-            const serialized_history = try std.json.Stringify.valueAlloc(arena, route_history.items, .{});
-            const serialized_tools = try std.json.Stringify.valueAlloc(arena, config.advertised_functions, .{});
-            var estimator = token_estimate.StreamingEstimator{};
-            for ([_][]const u8{ serialized_history, serialized_tools, job.prompt, config.system_prompt, config.host_instructions, job.context_snapshot.modelVisibleBytes(), config.custom_tool_guidance }) |part| {
-                estimator.consume(part);
-                estimator.consume("\n");
-            }
-            const required = 32_768 +| estimator.estimate();
+            const required = try jev_routing.estimateContextTokens(arena, route_history.items, config.advertised_functions, config.initial_dynamic_tools, &.{ job.prompt, config.system_prompt, config.host_instructions, job.context_snapshot.modelVisibleBytes(), config.custom_tool_guidance });
             var has_images = job.images.len > 0 or job.authorized_image_catalog.len > 0;
             for (route_history.items) |message| has_images = has_images or message.images.len > 0;
             const decision = try jev_routing.route(arena, .{

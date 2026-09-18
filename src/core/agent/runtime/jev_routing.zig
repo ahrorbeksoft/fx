@@ -5,6 +5,9 @@ const capabilities = @import("../../config/model_capabilities.zig");
 const io_mod = @import("../../shared/io.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const session_usage = @import("../../session/session_usage.zig");
+const token_estimate = @import("../../shared/token_estimate.zig");
+const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
+const prompt_context = @import("prompt_context.zig");
 
 /// A local selection mode, never an inference model sent to Gateway.
 pub const auto_model = "jev/auto";
@@ -34,6 +37,47 @@ pub fn previousModel(history: []const types.HistoryTurn) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Internal result memory and schema metadata are not model-visible tokens.
+/// Final provider serialization remains the authoritative capacity check.
+pub fn estimateContextTokens(alloc: std.mem.Allocator, history: []const types.ChatMessage, functions: []const model_tool_schema.FunctionSchema, dynamic_tools: []const stream.DynamicFunctionTool, parts: []const []const u8) !u64 {
+    var estimator = token_estimate.StreamingEstimator{};
+    for (parts) |part| {
+        estimator.consume(part);
+        estimator.consume("\n");
+    }
+    for (functions) |function| {
+        const json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, function);
+        defer alloc.free(json);
+        estimator.consume(json);
+        estimator.consume("\n");
+    }
+    for (history) |message| if (message.provider_replay) |replay| {
+        estimator.consume(replay.parts_json);
+        estimator.consume("\n");
+    };
+    for (dynamic_tools) |tool| {
+        const schema = try std.json.Stringify.valueAlloc(alloc, tool.input_schema, .{});
+        defer alloc.free(schema);
+        const json = try model_tool_schema.dynamicFunctionSchemaJsonAlloc(alloc, tool.name, tool.description, schema);
+        defer alloc.free(json);
+        estimator.consume(json);
+        estimator.consume("\n");
+    }
+    return 32_768 +| prompt_context.estimateCompactionSourceTokens(history) +| estimator.estimate();
+}
+
+test "Jev routing context measures model-visible text without duplicate result metadata" {
+    const alloc = std.testing.allocator;
+    const text = "tool result " ** 1000;
+    const plain = [_]types.ChatMessage{.{ .role = .tool, .content = text }};
+    const with_memory = [_]types.ChatMessage{.{ .role = .tool, .content = text, .tool_result_memory = .{ .preview = text, .output_bytes = text.len } }};
+    const expected = try estimateContextTokens(alloc, &plain, &.{}, &.{}, &.{});
+    try std.testing.expectEqual(expected, try estimateContextTokens(alloc, &with_memory, &.{}, &.{}, &.{}));
+    try std.testing.expect(expected > 32_768);
+    const functions = [_]model_tool_schema.FunctionSchema{.{ .name = "work", .description = "perform work" }};
+    try std.testing.expect(try estimateContextTokens(alloc, &plain, &functions, &.{}, &.{"system instructions"}) > expected);
 }
 const classes = [_][]const u8{ "routine", "general", "demanding" };
 const class_definitions = [_][]const u8{
