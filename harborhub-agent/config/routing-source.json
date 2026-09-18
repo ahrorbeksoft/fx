@@ -1,5 +1,5 @@
 {
-  "sourceCommit": "1e7a64046053af8cfec7a438d55f650433e43759",
+  "sourceCommit": "e32bb3e4b02a1486b8341fdfe9d8aaf1e0b478ee",
   "mode": "native-root-and-child-assignments",
   "policy": "jev-assignment-v2",
   "files": {
@@ -7,6 +7,6 @@
     "src/core/agent/runtime/jev_taxonomy.json": "a27b8f0bf2b9b084f35ad32253ed81feaf495c19585d9839d3ae5f142f84b76d",
     "src/core/agent/runtime/orchestrator.zig": "ad8904f604f3c3472c81d9bdf0232aaa2a473b380f88dc446f2e0a450f87159a",
     "src/core/agent/evaluation_provider.zig": "752842822319455d79f3728cfe35b68624cd440e5999bf815899aefa271d464f",
-    "src/gateway/jev.zig": "082f893b246f48eff734fd3d04d7bb7902696cb748774ca08f5e129267cfc414"
+    "src/gateway/jev.zig": "4023e3014ef9c00b7dba33480d20ad09d228e2042e29859958fe5114afa02e41"
   }
 }

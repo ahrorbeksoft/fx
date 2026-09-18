@@ -25,36 +25,36 @@
   },
   "compaction": {
     "file": "fx-compaction",
-    "sourceCommit": "2d817e68a868200453015b496b779f32f84012fd",
+    "sourceCommit": "b50733d1a4afe6bb90116afb0ec216cc09576d81",
     "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
-    "sha256": "b8e4d668b1cd358767c5974446c889278c51d6920d4922ce260c00fd04969c85",
-    "bytes": 12305704,
+    "sha256": "6a5d40fe22093d817f9d964756abd182120ffe3960f8b2187481945dd561efe0",
+    "bytes": 12305848,
     "zigVersion": "0.16.0",
     "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
     "status": "built-clean-source"
   },
   "routing": {
     "file": "fx-routing",
-    "sourceCommit": "1e7a64046053af8cfec7a438d55f650433e43759",
+    "sourceCommit": "e32bb3e4b02a1486b8341fdfe9d8aaf1e0b478ee",
     "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
-    "sha256": "30e7537237b9181e0b256416cbece37564ec9a65c3bc37c5c51068b839bd6ca7",
-    "bytes": 12338632,
+    "sha256": "b3e51e6f19e8c8a78e971cd326e20e16f3e45dbcdbfb2cdcb2bc1ea37d69a6a7",
+    "bytes": 12338792,
     "zigVersion": "0.16.0",
     "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
     "status": "built-clean-source"
   },
   "both": {
     "file": "fx-both",
-    "sourceCommit": "4831419cc1027701349cbcac3f64d68a9926bc3c",
+    "sourceCommit": "8b790c5b936e2e98578679d9f538aeb83270241c",
     "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
-    "sha256": "ca926c46f39ea9c11556004d8f51932dbd2943a1e0f7370f1de0cfc757c99cb5",
-    "bytes": 12350712,
+    "sha256": "b2872985b4ea3b627476043cdd851c81a3f9981d40a479e51417f396d6584132",
+    "bytes": 12350872,
     "zigVersion": "0.16.0",
     "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
     "status": "built-clean-source",
     "featureCommits": {
-      "routing": "1e7a64046053af8cfec7a438d55f650433e43759",
-      "compaction": "2d817e68a868200453015b496b779f32f84012fd"
+      "routing": "e32bb3e4b02a1486b8341fdfe9d8aaf1e0b478ee",
+      "compaction": "b50733d1a4afe6bb90116afb0ec216cc09576d81"
     }
   }
 }

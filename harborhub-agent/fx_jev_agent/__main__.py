@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .evaluation import POLICY, evaluate
+from .evaluation import POLICY, evaluate, evaluation_key
 
 from acp import (
     PROTOCOL_VERSION,
@@ -288,6 +288,12 @@ class FxAskAgent(Agent):
 
         if not os.environ.get("AI_GATEWAY_API_KEY"):
             raise RuntimeError("Direct Gateway credential missing; do not launch the matrix")
+        if build["variant"] in {"compaction", "routing", "both"}:
+            evaluation_key()
+        (FX_LOG.parent / "credential-sources.json").write_text(json.dumps({
+            "inference": "AI_GATEWAY_API_KEY",
+            "evaluation": "FX_JEV_GATEWAY_API_KEY" if build["variant"] in {"compaction", "routing", "both"} else None,
+        }, indent=2))
         if os.environ.get("FX_JEV_PREFLIGHT") == "1" and not session.get("preflight"):
             boolean_probe = await asyncio.to_thread(evaluate, "The old command completed successfully. The current task needs its exact result.", {
                 "retain": {"type": "boolean", "instructions": "Is the exact old command result still needed?"}

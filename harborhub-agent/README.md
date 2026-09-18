@@ -30,11 +30,15 @@ All arms run the same 89 Terminal-Bench 2.1 revision 6 tasks, one attempt per ta
 Jev compaction does not provide evidence about compaction efficacy. The routing
 policy is an experimental requirements rubric, not a learned success predictor.
 
-Use hosted `credential_mode: direct` with `AI_GATEWAY_API_KEY` selected. The v4
-submission supplies a dedicated personal-team key through Harbor's job-scoped
-`job_secrets`, which takes precedence over the organization's stored key. The
-organization's reusable credential is unchanged; the personal key is never
-written into the reviewed job JSON or source repository.
+Use hosted `credential_mode: direct`. Every arm uses Harbor's existing stored
+`AI_GATEWAY_API_KEY` for all model inference, including child agents and
+summarization fallbacks. The three Jev arms additionally select
+`FX_JEV_GATEWAY_API_KEY`, supplied from the user's personal Gateway team only for
+evaluation calls. `FX_JEV_GATEWAY_TEAM` optionally scopes those evaluation calls.
+The personal key never replaces `AI_GATEWAY_API_KEY`, and the adapter rejects a
+Jev arm when its dedicated evaluation credential is missing or empty. Main and
+patch-retry do not need the personal key. Keys are never written into reviewed
+job JSON or source. This setup does not buy credits or enable auto-reload.
 The generic Harbor inference proxy is not assumed to support Gateway's typed
 Jev evaluation protocol. A separate hello-world smoke gates live evaluation and
 all three candidate models before a full matrix. Security-policy failures block
@@ -53,6 +57,7 @@ are independent of the adapter's source commit and are recorded per trial.
 ## Per-trial evidence
 
 - `benchmark-build.json`: source commit, binary hash and build provenance.
+- `credential-sources.json`: credential environment names only, never key values.
 - `fx.json`: final fx JSON envelope and token usage.
 - `fx-usage.json`: native billing snapshot and completeness.
 - `fx-stderr.log` and `fx-trace.log`: runtime output and feature activation.

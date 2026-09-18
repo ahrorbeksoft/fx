@@ -41,15 +41,22 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def evaluation_key() -> str:
+    # Benchmarks require the split explicitly. Never bill evaluation to the
+    # regular inference key when the personal evaluation secret is missing.
+    key = os.environ.get("FX_JEV_GATEWAY_API_KEY")
+    if not key:
+        raise ValueError("evaluation_gateway_credential_missing")
+    return key
+
+
 def evaluate(state: str, questions: dict = QUESTIONS) -> dict:
     if not state or len(state.encode("utf-16-le")) // 2 > 24000:
         raise ValueError("classifier_input_size")
     # Direct mode is deliberate: the hosted generic inference proxy may not
     # implement Gateway's typed evaluation protocol. Never send its proxy token
     # to a provider. Preflight fails when the actual Gateway key is unavailable.
-    key = os.environ.get("AI_GATEWAY_API_KEY")
-    if not key:
-        raise ValueError("direct_gateway_credential_missing")
+    key = evaluation_key()
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                "ai-gateway-protocol-version": "0.0.1", "ai-evaluation-model-specification-version": "4", "ai-model-id": "typesafe-ai/jev"}
     if team := os.environ.get("FX_JEV_GATEWAY_TEAM"):
