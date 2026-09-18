@@ -114,3 +114,12 @@ fallbacks, telemetry and limitations.
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+### Separate Jev evaluation credentials
+
+Set `FX_JEV_GATEWAY_API_KEY` to a dedicated AI Gateway key for Jev routing
+evaluations. Normal model inference continues using its configured
+credential. With a dedicated key, `FX_JEV_GATEWAY_TEAM` optionally selects that
+key's team; the inference team's header is not inherited. An empty dedicated
+key rejects evaluation instead of using the inference key. Without the override,
+Jev uses the current Gateway credential and team as before.

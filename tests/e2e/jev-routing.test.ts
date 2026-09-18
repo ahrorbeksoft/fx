@@ -19,10 +19,12 @@ function nativeFixture(completion: (body: string) => Response, classify: (body: 
     id, type: "language", tags: ["tool-use"], context_window: 1_050_000, max_tokens: 8192,
   })) });
   const evaluations: any[] = [];
+  const evaluationHeaders: Headers[] = [];
   const evaluator = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     expect(request.headers.get("ai-model-id")).toBe("typesafe-ai/jev");
     const body = await request.json() as any;
     evaluations.push(body);
+    evaluationHeaders.push(request.headers);
     const taskClass = classify(body, evaluations.length - 1);
     if (taskClass instanceof Response) return taskClass;
     const selected: Record<string, string> = { family: "code-generation", taskClass };
@@ -39,7 +41,7 @@ function nativeFixture(completion: (body: string) => Response, classify: (body: 
     FX_E2E_JEV_URL: "http://127.0.0.1:" + evaluator.port + "/evaluate",
     FX_TRACE_LOG: join(root, "trace.log"), FX_TRACE_SCOPES: "quality,agent,subagent",
   };
-  return { root, home, cwd, gateway, evaluations, env,
+  return { root, home, cwd, gateway, evaluations, evaluationHeaders, env,
     async ask(prompt: string, args: string[] = [], extra: Record<string, string> = {}) {
       const child = Bun.spawn([binary, "ask", "--json", "--yolo", "--no-fast", ...args, "--", prompt], {
         cwd, env: { ...env, ...extra }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
@@ -79,6 +81,26 @@ test("native Jev routes follow-up prompts with history and preserves explicit ch
     passed = true;
   } finally { f.close(passed); }
 }, 90_000);
+
+test("native Jev keeps a dedicated evaluation key separate from inference", async () => {
+  const f = nativeFixture(() => fakeGatewayFinalText("SPLIT_KEYS_REPLY"), () => "routine");
+  let passed = false;
+  try {
+    const result = await f.ask("Implement a small helper.", [], {
+      FX_JEV_GATEWAY_API_KEY: "synthetic-evaluation-only", FX_JEV_GATEWAY_TEAM: "personal-evaluation-team",
+    });
+    expect(result.model).toBe(candidates[1]);
+    expect(f.evaluationHeaders.map(h => h.get("authorization"))).toEqual(["Bearer synthetic-evaluation-only"]);
+    expect(f.evaluationHeaders[0].get("x-vercel-ai-gateway-team")).toBe("personal-evaluation-team");
+    expect(f.gateway.requests.every(r => r.headers.get("authorization") === "Bearer synthetic-jev-native")).toBe(true);
+    expect(f.gateway.requests.every(r => r.headers.get("x-vercel-ai-gateway-team") !== "personal-evaluation-team")).toBe(true);
+    expect(readFileSync(f.env.FX_TRACE_LOG, "utf8")).not.toContain("synthetic-evaluation-only");
+    const fallback = await f.ask("Implement another helper.", [], { FX_JEV_GATEWAY_API_KEY: "" });
+    expect(fallback.model).toBe(candidates[0]);
+    expect(f.evaluationHeaders).toHaveLength(1);
+    passed = true;
+  } finally { f.close(passed); }
+}, 45_000);
 
 test("native Jev evaluator failure retains an eligible fallback and records overhead", async () => {
   const f = nativeFixture(() => fakeGatewayFinalText("FALLBACK_REPLY"), () => new Response("private provider error", { status: 403 }));
@@ -127,11 +149,13 @@ for (const parentAuto of [false, true]) test(`native Jev routes persistent child
   }, body => body.state.includes("ORIGIN: root") ? "general" : body.state.split("ORIGIN:")[0].includes("HARD_CHILD") ? "demanding" : "routine");
   let passed = false;
   try {
-    const result = await f.ask("Delegate the two child assignments.", parentAuto ? [] : ["--model", candidates[0]], { FX_EXPERIMENT_JEV_SUBAGENT_ROUTING: "1" });
+    const result = await f.ask("Delegate the two child assignments.", parentAuto ? [] : ["--model", candidates[0]], { FX_EXPERIMENT_JEV_SUBAGENT_ROUTING: "1", FX_JEV_GATEWAY_API_KEY: "synthetic-child-evaluation" });
     expect(result.output).toBe("PARENT_DONE");
     expect(f.evaluations).toHaveLength(parentAuto ? 3 : 2);
     const childEvaluations = f.evaluations.filter(e => e.state.includes("ORIGIN: subagent"));
     expect(childEvaluations).toHaveLength(2);
+    expect(f.evaluationHeaders.every(h => h.get("authorization") === "Bearer synthetic-child-evaluation")).toBe(true);
+    expect(f.gateway.requests.every(r => r.headers.get("authorization") === "Bearer synthetic-jev-native")).toBe(true);
     expect(childEvaluations[1].state).toContain("SMALL_CHILD");
     expect(childModels[0]).toBe(candidates[1]);
     expect(childModels[1]).toBe(candidates[1]);
