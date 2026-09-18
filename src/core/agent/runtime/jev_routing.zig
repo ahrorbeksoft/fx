@@ -18,6 +18,23 @@ pub fn modelKey(id: []const u8) ?types.JevRoutingModel {
     for (models, 0..) |model, index| if (std.mem.eql(u8, model, id)) return @enumFromInt(index);
     return null;
 }
+
+/// Borrowed candidate ID with static lifetime, including after session resume.
+pub fn previousModel(history: []const types.HistoryTurn) ?[]const u8 {
+    var i = history.len;
+    while (i > 0) {
+        i -= 1;
+        if (types.historyTurnSummary(history[i])) |summary| {
+            if (summary.jev_model) |key| return modelId(key);
+        }
+        if (history[i] == .assistant) {
+            if (history[i].assistant.provider_replay) |replay| {
+                if (modelKey(replay.source.model)) |key| return modelId(key);
+            }
+        }
+    }
+    return null;
+}
 const classes = [_][]const u8{ "routine", "general", "demanding" };
 const class_definitions = [_][]const u8{
     "Narrow, explicitly specified work with a direct solution: small edit, formatting, extraction or basic operation. No substantial diagnosis or novel algorithm.",
