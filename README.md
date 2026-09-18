@@ -102,6 +102,12 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 
 [Apache-2.0](LICENSE). Third-party licenses and attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Experimental model routing
+
+The [experimental Jev routing example](examples/jev-routing/README.md) uses AI
+Gateway to classify a task and launch `fx ask` with a selected model. It is an
+opt-in client-side experiment; normal fx model selection is unchanged.
+
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
