@@ -363,38 +363,7 @@ fn duplicateToolResultMemory(
     source: ?types.ToolResultMemory,
 ) Allocator.Error!?types.ToolResultMemory {
     const memory = source orelse return null;
-    const output_handle = if (memory.output_handle) |handle|
-        try alloc.dupe(u8, handle)
-    else
-        null;
-    errdefer if (output_handle) |handle| alloc.free(handle);
-    const preview = if (memory.preview) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (preview) |value| alloc.free(value);
-    const command_output_replay = if (memory.command_output_replay) |replay|
-        try types.dupeCommandOutputReplay(alloc, replay)
-    else
-        null;
-    errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
-
-    const image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (image_handle) |handle| alloc.free(handle);
-    const tool_images = try types.dupeToolImages(alloc, memory.tool_images);
-    return .{
-        .tool_images = tool_images,
-        .tool_image_handle = image_handle,
-        .output_handle = output_handle,
-        .preview = preview,
-        .output_bytes = memory.output_bytes,
-        .stored_output_bytes = memory.stored_output_bytes,
-        .truncated = memory.truncated,
-        .model_view_covers_full_file = memory.model_view_covers_full_file,
-        .command_output_replay = command_output_replay,
-        .command_process_presentation = memory.command_process_presentation,
-        .terminal_action_presentation = memory.terminal_action_presentation,
-    };
+    return try types.dupeToolResultMemory(alloc, memory);
 }
 
 pub fn reportInnerToolUsage(hooks: *const AgentRuntimeDeps, tool_name: []const u8, execution: ToolExecutionResult) void {
@@ -424,6 +393,7 @@ fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) v
         if (memory.command_output_replay) |replay| {
             types.freeCommandOutputReplay(alloc, replay);
         }
+        if (memory.committed_file_presentation) |presentation| types.freeCommittedFilePresentation(alloc, presentation);
     }
 }
 

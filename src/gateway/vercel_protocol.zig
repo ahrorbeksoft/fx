@@ -644,27 +644,31 @@ const tool_image_followup_text = "Attached image(s) from the tool result.";
 // provider route renders as vision input, while tool-result-position images
 // are ignored by several routes (and the legacy "image-data" part type was
 // removed from the gateway spec). Writes nothing when the run has no images.
+
+// deliverableToolImages mirrors the tool-result gate: images from
+// permission-denied results never leave the process.
+fn deliverableToolImages(result: ChatMessage) []const types.ToolImage {
+    const memory = result.tool_result_memory orelse return &.{};
+    if (memory.tool_images.len == 0) return &.{};
+    const failed = if (result.tool_result_status) |status| status == .failure else false;
+    if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) return &.{};
+    return memory.tool_images;
+}
+
 fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMessage, budget: ?BuildBudget) !void {
     var has_images = false;
     for (results) |result| {
-        const memory = result.tool_result_memory orelse continue;
-        if (memory.tool_images.len == 0) continue;
-        const failed = if (result.tool_result_status) |status| status == .failure else false;
-        if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) continue;
-        has_images = true;
-        break;
+        if (deliverableToolImages(result).len > 0) {
+            has_images = true;
+            break;
+        }
     }
     if (!has_images) return;
     try writer.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.value(tool_image_followup_text, .{}, writer);
     try writer.writeByte('}');
     for (results) |result| {
-        // Mirror the tool-result gate: images from permission-denied results
-        // never leave the process.
-        const failed = if (result.tool_result_status) |status| status == .failure else false;
-        if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) continue;
-        const memory = result.tool_result_memory orelse continue;
-        for (memory.tool_images) |image| {
+        for (deliverableToolImages(result)) |image| {
             if (budget) |active| try active.check();
             try writer.writeAll(",{\"type\":\"file\",\"mediaType\":");
             try std.json.Stringify.value(image.mime_type, .{}, writer);
