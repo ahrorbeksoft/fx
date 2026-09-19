@@ -953,6 +953,9 @@ pub const State = struct {
     menu_feedback: ?[]u8 = null,
     menu_add_form: MenuAddForm = .{},
     menu_argument_form: MenuArgumentForm = .{},
+    /// Main-thread only, like the menu fields: a startup summary notice is
+    /// owed once discovery settles with servers that need attention.
+    startup_health_notice_pending: bool = false,
     model_catalog_baseline_lock: std.Io.Mutex = .init,
     /// Server availability as of the previous model-catalog report, used to
     /// surface mid-session changes (authentication, reload, recovery) to the
@@ -1710,6 +1713,25 @@ pub const State = struct {
         var lease = self.acquire() orelse return;
         defer lease.deinit();
         lease.runtime.startDiscovery(registry);
+        // Main-thread only, like the menu fields: post one summary notice once
+        // startup discovery settles with servers that need attention.
+        self.startup_health_notice_pending = true;
+    }
+
+    /// Returns the one-shot startup summary notice once discovery has settled
+    /// with servers needing attention. Main-thread only, like the menu fields.
+    pub fn takeStartupHealthNotice(self: *State, alloc: Allocator) !?[]u8 {
+        if (!self.startup_health_notice_pending) return null;
+        var lease = self.acquire() orelse {
+            self.startup_health_notice_pending = false;
+            return null;
+        };
+        defer lease.deinit();
+        if (lease.runtime.isDiscovering()) return null;
+        self.startup_health_notice_pending = false;
+        var snapshot = try lease.runtime.snapshotHealth(alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+        defer snapshot.deinit(alloc);
+        return try mcp_health.renderStartupNotice(alloc, snapshot);
     }
 
     pub fn acquire(self: *State) ?Lease {
