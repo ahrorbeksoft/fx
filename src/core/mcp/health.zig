@@ -33,9 +33,11 @@ pub const AuthenticationState = enum {
     required,
 };
 
-/// The single product-level status of a configured server. Every surface
-/// (list, summary, menu, trace, model catalog, capability search) derives
-/// from this classification; never re-classify the raw axes per surface.
+/// The single product-level status of a configured server. Surfaces that
+/// render connection/authentication state (list, summary, menu, trace, model
+/// catalog, capability search) derive from this classification instead of
+/// re-classifying the raw axes; menus may additionally model their own axes
+/// (reloading, trust admission) on top.
 pub const Status = enum {
     disabled,
     connecting,
@@ -679,6 +681,16 @@ test "startupDecision keeps blocking required servers that need authentication" 
     ready_server.authentication = .authenticated;
     var ready_servers = [_]ServerSnapshot{ ready_server, optional_auth };
     try std.testing.expectEqual(StartupDecision.degraded, startupDecision(&ready_servers));
+
+    // A ready server with a freshly observed auth challenge classifies as
+    // needs_auth, so a required one still blocks and an optional one degrades.
+    var ready_challenged = emptyServerSnapshot();
+    ready_challenged.required = true;
+    ready_challenged.connection = .ready;
+    ready_challenged.authentication = .required;
+    try std.testing.expectEqual(Status.needs_auth, classify(ready_challenged.connection, ready_challenged.authentication, false));
+    var challenged_servers = [_]ServerSnapshot{ready_challenged};
+    try std.testing.expectEqual(StartupDecision.blocked, startupDecision(&challenged_servers));
 }
 
 test "render prints the classified status next to the raw axes" {
