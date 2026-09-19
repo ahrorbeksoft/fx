@@ -120,7 +120,7 @@ pub fn parseMethod(value: []const u8) ?Method {
 }
 
 fn providerVisible(id: model_provider.ProviderId) bool {
-    if (comptime host_target.is_wasm) return id != .grok;
+    if (comptime host_target.is_wasm) return id != .grok and id != .cliproxyapi;
     return true;
 }
 
