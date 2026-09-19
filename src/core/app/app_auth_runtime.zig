@@ -272,7 +272,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "",
                         .tone = .warning,
-                        .body = "usage: /logout [vercel|codex|grok]",
+                        .body = "usage: /logout [vercel|codex|grok|cliproxyapi]",
                     });
                     return;
                 };
@@ -291,6 +291,14 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
+            if (logout_provider == .cliproxyapi) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .neutral,
+                    .body = "CLIProxyAPI uses an API key, not a sign-in session. Remove the key to sign out.",
+                });
+                return;
+            }
             const hold_turn_start = logout_provider.eql(selected_provider) and logout_provider != .gateway;
             if (hold_turn_start and (app.stream.active or !app.worker.tryHoldTurnStart())) {
                 try writeAuthNotice(app, .{

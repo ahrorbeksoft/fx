@@ -64,7 +64,7 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
     if (!removed.eql(facts.selected) or removed == .gateway) return candidates;
 
     var count: usize = 0;
-    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok, .cliproxyapi }) |provider| {
         if (provider.eql(removed)) continue;
         const available = switch (provider) {
             .gateway => facts.available_sources.contains(.vercel_oidc_token) or
@@ -73,10 +73,12 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
                 facts.available_sources.contains(.stored_key),
             .codex => facts.available_sources.contains(.chatgpt_subscription),
             .grok => facts.available_sources.contains(.grok_subscription),
-            .cliproxyapi => false,
+            .cliproxyapi => facts.available_sources.contains(.cliproxyapi_api_key) or
+                facts.available_sources.contains(.cliproxyapi_stored_key),
             .configured => false,
         };
         if (!available) continue;
+        if (count == candidates.len) break;
         candidates[count] = provider;
         count += 1;
     }

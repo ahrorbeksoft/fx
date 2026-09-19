@@ -1087,7 +1087,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|cliproxyapi]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1096,6 +1096,10 @@ fn runNonInteractiveWithDeps(
             }
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .cliproxyapi) {
+                try writeStdout(deps, "CLIProxyAPI uses an API key. Start fx and run /provider to add one.\n");
+                return .handled_success;
+            }
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
@@ -1119,7 +1123,7 @@ fn runNonInteractiveWithDeps(
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|cliproxyapi]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1128,6 +1132,10 @@ fn runNonInteractiveWithDeps(
             }
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .cliproxyapi) {
+                try writeStdout(deps, "CLIProxyAPI uses an API key, not a sign-in session. Unset FX_CLIPROXYAPI_KEY or remove the stored key to sign out.\n");
+                return .handled_success;
+            }
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
