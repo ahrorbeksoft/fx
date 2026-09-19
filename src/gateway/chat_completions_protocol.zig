@@ -2066,20 +2066,24 @@ test "chat completions rejects unsupported requests and ambiguous selection" {
 
 test "chat completions serializes selected reasoning effort" {
     const alloc = std.testing.allocator;
+    const cliproxyapi_provider: model_provider.ProviderId = .cliproxyapi;
     var request = test_request();
     request.provider_options.reasoning = types.ReasoningEffort.literal("high");
-    const body = try build_request(alloc, request, .{});
+    const body = try build_request(alloc, request, .{ .provider = &cliproxyapi_provider });
     defer alloc.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("high", parsed.value.object.get("reasoning_effort").?.string);
 
     request.provider_options.reasoning = .auto;
-    const default_body = try build_request(alloc, request, .{});
+    const default_body = try build_request(alloc, request, .{ .provider = &cliproxyapi_provider });
     defer alloc.free(default_body);
     var parsed_default = try std.json.parseFromSlice(std.json.Value, alloc, default_body, .{});
     defer parsed_default.deinit();
     try std.testing.expect(parsed_default.value.object.get("reasoning_effort") == null);
+
+    request.provider_options.reasoning = types.ReasoningEffort.literal("high");
+    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
 }
 
 test "chat completions rejects unmatched native malformed and duplicate history calls" {
