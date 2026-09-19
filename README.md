@@ -13,7 +13,9 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 
 ## About this fork
 
-This fork tracks upstream `main` and carries personal changes on top. Work here is experimental and may diverge from upstream behavior. If a change is meant for the main project, it is developed on a branch here first and proposed upstream separately.
+This fork adds support for [CLIProxyAPI](https://github.com/luispater/CLIProxyAPI) as a model provider, which upstream does not include. It lets fx discover models and reasoning levels from a local CLIProxyAPI server (default `http://localhost:8317/v1`), authenticate with a pasted API key or `FX_CLIPROXYAPI_KEY`, and override the server URL with `FX_CLIPROXYAPI_BASE_URL`.
+
+Other changes here are experimental and may diverge from upstream behavior.
 
 To build and test from this checkout:
 
