@@ -177,6 +177,7 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .warning,
                     .body = switch (provider) {
                         .gateway => credentials.missing_interactive_credential_message,
+                        .cliproxyapi => "CLIProxyAPI needs an API key. Run /provider and choose CLIProxyAPI to add one.",
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
                         .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
@@ -780,11 +781,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn applyApiKeySaveResult(app: *App, result: auth_runtime.ApiKeySaveResult) !void {
+            const key_provider = app.auth.pickerView().active_provider;
             switch (result) {
                 .empty => return,
                 .saved => |changed| {
                     applyCredentialChange(app, changed);
-                    rememberCredentialSource(app, .stored_key);
+                    const saved_source = app.auth.credentialSource() orelse .stored_key;
+                    rememberCredentialSource(app, saved_source);
                     const body = try std.fmt.allocPrint(
                         app.alloc,
                         "Saved the API key to {s} and made it active.",
@@ -796,27 +799,34 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = body,
                     }, true);
-                    // Only the inline `/provider vercel api-key` path implies
-                    // "use the gateway now": the user named the provider on the
+                    // Only an inline `/provider ... api-key` path implies
+                    // "use this provider now": the user named the provider on the
                     // way in. The staged hub also reaches this save, and there
                     // adding a key is not a request to switch.
                     if (comptime provider_runtime.supported(App) and provider_picker_runtime.supported(App)) {
+                        const target = app.auth.pickerView().active_provider;
                         if (app.input_runtime.picker.provider_picker_stage == .api_key and
-                            provider_runtime.provider(app) != .gateway)
+                            !provider_runtime.provider(app).eql(target))
                         {
-                            try switchProvider(app, .gateway, false, .manual);
+                            try switchProvider(app, target, false, .manual);
                         }
                     }
                 },
                 .gateway_refused => try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "The AI Gateway refused that API key. Nothing was stored.",
+                    .body = if (key_provider == .cliproxyapi)
+                        "CLIProxyAPI refused that API key. Nothing was stored."
+                    else
+                        "The AI Gateway refused that API key. Nothing was stored.",
                 }, true),
                 .gateway_unavailable => try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Could not verify that API key with AI Gateway. Nothing was stored.",
+                    .body = if (key_provider == .cliproxyapi)
+                        "Could not verify that API key with CLIProxyAPI. Nothing was stored."
+                    else
+                        "Could not verify that API key with AI Gateway. Nothing was stored.",
                 }, true),
                 .store_failed => {
                     const body = try std.fmt.allocPrint(
@@ -915,6 +925,9 @@ pub fn Runtime(comptime App: type) type {
             // ChatGPT is selected by model route, not as a global Gateway
             // credential preference. Its saved session coexists independently.
             if (source == .chatgpt_subscription or source == .grok_subscription) return;
+            // CLIProxyAPI keys resolve under their own provider; persisting one as
+            // the global preference would poison Gateway startup resolution.
+            if (source == .cliproxyapi_api_key or source == .cliproxyapi_stored_key) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
@@ -1226,10 +1239,10 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
-                        .gateway, .configured => {},
+                        .gateway, .cliproxyapi, .configured => {},
                     }
                 }
-                if (target == .gateway or !request.allow_login) {
+                if (target == .gateway or target == .cliproxyapi or !request.allow_login) {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
@@ -1835,6 +1848,8 @@ pub fn Runtime(comptime App: type) type {
                 .vercel_oidc_token,
                 .ai_gateway_api_key,
                 .stored_key,
+                .cliproxyapi_api_key,
+                .cliproxyapi_stored_key,
                 .host_managed,
                 .configured,
                 => {},
@@ -1955,11 +1970,11 @@ pub fn Runtime(comptime App: type) type {
                         }
                         return;
                     }
-                    const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
-                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
+                    const provider_scoped = if (comptime @hasField(@TypeOf(credential), "source"))
+                        !model_provider.authorizesCredential(.gateway, credential.source)
                     else
                         false;
-                    if (subscription) {
+                    if (provider_scoped) {
                         app.session.usage.clearReconciliationCredential();
                     } else {
                         if (comptime @hasDecl(
@@ -2230,7 +2245,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway, .configured => unreachable,
+                .gateway, .cliproxyapi, .configured => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

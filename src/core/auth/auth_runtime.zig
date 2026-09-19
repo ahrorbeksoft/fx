@@ -33,13 +33,15 @@ const credential_source_order = [_]credentials.Source{
     .ai_gateway_api_key,
     .fx_login,
     .stored_key,
+    .cliproxyapi_api_key,
+    .cliproxyapi_stored_key,
     .chatgpt_subscription,
     .grok_subscription,
 };
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
 const CredentialLoaderFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!?credentials.Credential;
-const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror!void;
+const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, credentials.Source, []const u8) anyerror!void;
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
 const max_api_key_mask_glyphs = provider_picker_catalog.max_key_mask_glyphs;
@@ -363,6 +365,13 @@ pub fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
+    if (provider == .cliproxyapi) {
+        if (model_provider.authorizesCredential(provider, preferred)) return preferred;
+        return if (credentials.sourcePresence(host.unavailable_secret_store, .cliproxyapi_api_key) == .present)
+            .cliproxyapi_api_key
+        else
+            .cliproxyapi_stored_key;
+    }
     if (provider != .gateway) return provider_catalog.find(provider).login_source;
     return if (model_provider.authorizesCredential(provider, preferred)) preferred else null;
 }
@@ -567,6 +576,7 @@ const ApiKeySaveDeps = struct {
     validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     store: StoredKeyStoreFn = storeUnavailableSecret,
     loader: CredentialLoaderFn = loadCredentialSource,
+    stored_source: credentials.Source = .stored_key,
 };
 
 /// The whole save sequence with no runtime state, so outcome behaviour can be
@@ -577,16 +587,16 @@ fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) Ap
         .refused => return .gateway_refused,
         .unavailable => return .gateway_unavailable,
     }
-    deps.store(deps.ctx, alloc, key) catch |err| {
+    deps.store(deps.ctx, alloc, deps.stored_source, key) catch |err| {
         debug_trace.logf("auth", "api key save failed step=store err={s}", .{@errorName(err)});
         return .store_failed;
     };
-    const loaded = deps.loader(deps.ctx, alloc, .stored_key) catch |err| {
+    const loaded = deps.loader(deps.ctx, alloc, deps.stored_source) catch |err| {
         debug_trace.logf("auth", "api key save failed step=reload err={s}", .{@errorName(err)});
         return .reload_failed;
     };
     const credential = loaded orelse return .reload_failed;
-    if (credential.source != .stored_key) {
+    if (credential.source != deps.stored_source) {
         var wrong = credential;
         wrong.deinit(alloc);
         return .reload_failed;
@@ -1464,9 +1474,14 @@ pub const StatusSnapshot = struct {
         return switch (required_source) {
             .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
             .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
+            .cliproxyapi_api_key => "FX_CLIPROXYAPI_KEY is selected but unavailable. Set FX_CLIPROXYAPI_KEY before starting fx; no other credential was selected.",
             .stored_key => switch (surface) {
                 .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
+            },
+            .cliproxyapi_stored_key => switch (surface) {
+                .cli => "A stored CLIProxyAPI key is selected but unavailable. Start fx and open /provider to add one.",
+                .interactive => "A stored CLIProxyAPI key is selected but unavailable. Run /provider to add one.",
             },
             .fx_login => switch (surface) {
                 .cli => if (self.fx_login_status == .unavailable)
@@ -1564,9 +1579,10 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .configured;
-    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok)) or
-        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
+    var gateway_connected = model_provider.authorizesCredential(.gateway, resolved_source);
+    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok or provider.? == .cliproxyapi)) or
+        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription or
+        resolved_source == .cliproxyapi_api_key or resolved_source == .cliproxyapi_stored_key;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
             if (credentials.sourceExists(alloc, secret_store, source) catch |err| switch (err) {
@@ -1642,6 +1658,7 @@ pub const Runtime = struct {
     const Self = @This();
 
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
+    cliproxyapi_api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
     auth_mode: credentials.AuthMode = .local,
@@ -1719,12 +1736,13 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 31) {
+            if (std.meta.fields(Self).len != 32) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
         storage.* = undefined;
         storage.api_key_validator = validator;
+        storage.cliproxyapi_api_key_validator = api_key_validator.unavailable_provider;
         storage.oauth_transport = transport;
         storage.secret_store = secret_store;
         storage.auth_mode = auth_mode;
@@ -1771,6 +1789,10 @@ pub const Runtime = struct {
         self.team_query.deinit(alloc);
         if (self.selected_credential) |*credential| credential.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn setProviderApiKeyValidator(self: *Self, provider: model_provider.ProviderId, validator: api_key_validator.Provider) void {
+        if (provider == .cliproxyapi) self.cliproxyapi_api_key_validator = validator;
     }
 
     /// Borrows the current credential until this runtime replaces or releases it.
@@ -2276,8 +2298,9 @@ pub const Runtime = struct {
     /// Opens the key field for the inline `/provider` picker. The stage is the
     /// same one the staged panel uses, so entry, saving, and cancelling all
     /// keep working; only the rendering differs.
-    pub fn openApiKeyPickerInline(self: *Self, alloc: Allocator) void {
+    pub fn openApiKeyPickerInline(self: *Self, alloc: Allocator, provider: model_provider.ProviderId) void {
         self.openApiKeyPickerWithParent(alloc, false);
+        self.provider_picker_active = provider;
         self.api_key_inline = true;
     }
 
@@ -2453,9 +2476,10 @@ pub const Runtime = struct {
     pub fn beginApiKeySave(self: *Self, alloc: Allocator) ApiKeySaveStart {
         return self.beginApiKeySaveWithDeps(alloc, .{
             .ctx = self,
-            .validator = self.api_key_validator,
+            .validator = if (self.provider_picker_active == .cliproxyapi) self.cliproxyapi_api_key_validator else self.api_key_validator,
             .store = storeRuntimeSecret,
             .loader = loadRuntimeCredentialSource,
+            .stored_source = if (self.provider_picker_active == .cliproxyapi) .cliproxyapi_stored_key else .stored_key,
         });
     }
 
@@ -2770,6 +2794,7 @@ pub const Runtime = struct {
         };
         defer if (resolution.credential) |*credential| credential.deinit(alloc);
         if (resolution.credential) |*credential| {
+            if (!model_provider.authorizesCredential(provider, credential.source)) return .missing;
             return if (self.adoptCredential(alloc, credential)) .selected else .unchanged;
         }
         if (resolution.failure) |failure| return .{ .failed = failure };
@@ -2839,7 +2864,7 @@ pub const Runtime = struct {
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!model_provider.authorizesCredential(.gateway, source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) {
                 return self.credentialSource() != previous;
@@ -2901,7 +2926,7 @@ pub const Runtime = struct {
         if (!login_was_active) return false;
 
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!model_provider.authorizesCredential(.gateway, source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) return true;
             self.source_inventory.remove(source);
@@ -3039,12 +3064,12 @@ fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: crede
     };
 }
 
-fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
+fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source, value: []const u8) !void {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
-    return self.secret_store.store(alloc, value);
+    return self.secret_store.store(alloc, credentials.secretSlot(source), value);
 }
 
-fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
+fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: credentials.Source, _: []const u8) !void {
     return error.StoredKeyWriteFailed;
 }
 
@@ -3067,7 +3092,7 @@ fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 
 fn gatewaySourceCount(sources: SourceSet) usize {
     var count: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!model_provider.authorizesCredential(.gateway, source) or !sources.contains(source)) continue;
         count += 1;
     }
     return count;
@@ -3076,7 +3101,7 @@ fn gatewaySourceCount(sources: SourceSet) usize {
 fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {
     var index: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!model_provider.authorizesCredential(.gateway, source) or !sources.contains(source)) continue;
         if (index == wanted_index) return source;
         index += 1;
     }
@@ -3088,6 +3113,7 @@ fn credentialAuthorityFacts(credential: credentials.Credential) auth_transition.
         .provider = switch (credential.source) {
             .chatgpt_subscription => .codex,
             .grok_subscription => .grok,
+            .cliproxyapi_api_key, .cliproxyapi_stored_key => .cliproxyapi,
             else => .gateway,
         },
         .source = credential.source,
@@ -3127,6 +3153,7 @@ const ApiKeySaveFixture = struct {
     validate_calls: usize = 0,
     store_calls: usize = 0,
     load_calls: usize = 0,
+    stored_source: ?credentials.Source = null,
 
     fn validate(raw_ctx: ?*anyopaque, _: Allocator, _: []const u8) api_key_validator.Result {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
@@ -3159,6 +3186,7 @@ const ApiKeySaveFixture = struct {
     fn secretStoreLoad(
         raw_ctx: ?*anyopaque,
         alloc: Allocator,
+        _: host.SecretSlot,
     ) host.SecretStoreLoadError!?[]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
         self.load_calls += 1;
@@ -3169,6 +3197,7 @@ const ApiKeySaveFixture = struct {
     fn secretStoreWrite(
         raw_ctx: ?*anyopaque,
         _: Allocator,
+        _: host.SecretSlot,
         _: []const u8,
     ) host.SecretStoreWriteError!void {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
@@ -3179,14 +3208,16 @@ const ApiKeySaveFixture = struct {
 
     fn secretStoreInteractiveWrite(
         _: ?*anyopaque,
+        _: host.SecretSlot,
     ) host.SecretStoreWriteError!bool {
         return false;
     }
 
-    fn store(raw_ctx: ?*anyopaque, _: Allocator, _: []const u8) !void {
+    fn store(raw_ctx: ?*anyopaque, _: Allocator, source: credentials.Source, _: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
         if (self.gate) |gate| while (!gate.load(.seq_cst)) {};
         self.store_calls += 1;
+        self.stored_source = source;
         if (self.fail_store) return error.TestStoreFailed;
     }
 
@@ -3201,6 +3232,24 @@ const ApiKeySaveFixture = struct {
         return try makeTestCredential(alloc, "loaded-key", source, null, null);
     }
 };
+
+test "API key save keeps CLIProxyAPI in its own credential slot" {
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{};
+    var outcome = performApiKeySave(alloc, "proxy-key", .{
+        .ctx = &fixture,
+        .validator = fixture.validator(),
+        .store = ApiKeySaveFixture.store,
+        .loader = ApiKeySaveFixture.load,
+        .stored_source = .cliproxyapi_stored_key,
+    });
+    defer outcome.deinit(alloc);
+    try std.testing.expectEqual(credentials.Source.cliproxyapi_stored_key, fixture.stored_source.?);
+    switch (outcome) {
+        .loaded => |credential| try std.testing.expectEqual(credentials.Source.cliproxyapi_stored_key, credential.source),
+        else => return error.TestUnexpectedResult,
+    }
+}
 
 fn enterTestApiKey(runtime: *Runtime, alloc: Allocator, value: []const u8) !void {
     runtime.openApiKeyPicker(alloc);
@@ -4099,7 +4148,7 @@ test "auth runtime failed selection preserves the active credential" {
 
 test "provider selection preserves failure provenance and prior authority until recovery" {
     const FailedAllocation = struct {
-        fn load(_: ?*anyopaque, _: Allocator) host.SecretStoreLoadError!?[]u8 {
+        fn load(_: ?*anyopaque, _: Allocator, _: host.SecretSlot) host.SecretStoreLoadError!?[]u8 {
             return error.OutOfMemory;
         }
     };

@@ -7,10 +7,12 @@ const xai_grok = @import("../gateway/xai_grok.zig");
 const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
+const cliproxyapi = @import("../gateway/cliproxyapi.zig");
 
 pub const native = provider_set.Set{
     .configured_fn = @import("../gateway/chat_completions.zig").bundle,
     .gateway = gateway.provider_bundle,
+    .cliproxyapi = cliproxyapi.provider_bundle,
     .codex = .{
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,

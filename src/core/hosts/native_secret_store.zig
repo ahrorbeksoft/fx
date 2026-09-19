@@ -34,23 +34,24 @@ fn isDisabled() bool {
 
 /// Returns the stored key, or null when no key is stored. An error means the store
 /// could not be read, which callers must keep distinct from absence.
-fn load(alloc: Allocator) LoadError!?[]u8 {
-    if (comptime builtin.os.tag == .macos) return loadFromKeychain(alloc);
-    return loadFromProfile(alloc);
+fn load(alloc: Allocator, slot: host.SecretSlot) LoadError!?[]u8 {
+    if (comptime builtin.os.tag == .macos) return loadFromKeychain(alloc, slot);
+    return loadFromProfile(alloc, slot);
 }
 
-fn store(alloc: Allocator, value: []const u8) StoreError!void {
+fn store(alloc: Allocator, slot: host.SecretSlot, value: []const u8) StoreError!void {
     if (value.len == 0) return error.StoredKeyWriteFailed;
     if (comptime builtin.os.tag == .macos) {
-        keychain.storeValue(value) catch |err| return writeFailed("keychain", err);
+        keychain.storeServiceValue(keychainService(slot), value) catch |err| return writeFailed("keychain", err);
         return;
     }
-    return storeInProfile(alloc, value);
+    return storeInProfile(alloc, slot, value);
 }
 
 /// Let the platform credential store own terminal input when it supports a
 /// secure prompt, keeping plaintext out of the fx process.
-fn storeInteractive() StoreError!bool {
+fn storeInteractive(slot: host.SecretSlot) StoreError!bool {
+    if (slot != .gateway_api_key) return false;
     if (comptime builtin.os.tag == .macos) {
         keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
         return true;
@@ -62,15 +63,15 @@ fn isDisabledCallback(_: ?*anyopaque) bool {
     return isDisabled();
 }
 
-fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
+fn presenceCallback(_: ?*anyopaque, slot: host.SecretSlot) host.SecretStorePresence {
     if (isDisabled()) return .missing;
     if (comptime builtin.os.tag == .macos) {
-        return keychain.contains() catch .unavailable;
+        return keychain.containsServiceName(keychainService(slot)) catch .unavailable;
     }
-    return presenceInProfile();
+    return presenceInProfile(slot);
 }
 
-fn presenceInProfile() host.SecretStorePresence {
+fn presenceInProfile(slot: host.SecretSlot) host.SecretStorePresence {
     const home = io_mod.getenv("HOME") orelse return .unavailable;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch
         return .unavailable;
@@ -79,38 +80,39 @@ fn presenceInProfile() host.SecretStorePresence {
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer fx_dir.close(io_mod.getIo());
-    const stat = fx_dir.statFile(io_mod.getIo(), profile_paths.api_key_file_name, .{
+    const stat = fx_dir.statFile(io_mod.getIo(), profileFileName(slot), .{
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return .unavailable;
     return if (stat.size == 0) .missing else .present;
 }
 
-fn loadCallback(_: ?*anyopaque, alloc: Allocator) LoadError!?[]u8 {
-    return load(alloc);
+fn loadCallback(_: ?*anyopaque, alloc: Allocator, slot: host.SecretSlot) LoadError!?[]u8 {
+    return load(alloc, slot);
 }
 
 fn storeCallback(
     _: ?*anyopaque,
     alloc: Allocator,
+    slot: host.SecretSlot,
     value: []const u8,
 ) StoreError!void {
-    return store(alloc, value);
+    return store(alloc, slot, value);
 }
 
-fn storeInteractiveCallback(_: ?*anyopaque) StoreError!bool {
-    return storeInteractive();
+fn storeInteractiveCallback(_: ?*anyopaque, slot: host.SecretSlot) StoreError!bool {
+    return storeInteractive(slot);
 }
 
-fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
-    return keychain.load(alloc) catch |err| switch (err) {
+fn loadFromKeychain(alloc: Allocator, slot: host.SecretSlot) LoadError!?[]u8 {
+    return keychain.loadService(alloc, keychainService(slot)) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.KeychainItemNotFound => null,
         else => error.StoredKeyUnreadable,
     };
 }
 
-fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
+fn loadFromProfile(alloc: Allocator, slot: host.SecretSlot) LoadError!?[]u8 {
     const home = io_mod.getenv("HOME") orelse {
         debug_trace.logf("stored_key", "load failed step=home err=HomeNotSet", .{});
         return error.StoredKeyUnreadable;
@@ -133,11 +135,11 @@ fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
     };
     defer fx_dir.close(io_mod.getIo());
 
-    return loadFromDir(alloc, &fx_dir);
+    return loadFromDir(alloc, &fx_dir, profileFileName(slot));
 }
 
-fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
-    var file = fx_dir.openFile(io_mod.getIo(), profile_paths.api_key_file_name, .{
+fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, file_name: []const u8) LoadError!?[]u8 {
+    var file = fx_dir.openFile(io_mod.getIo(), file_name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -179,7 +181,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
     return try alloc.dupe(u8, trimmed);
 }
 
-fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
+fn storeInProfile(alloc: Allocator, slot: host.SecretSlot, value: []const u8) StoreError!void {
     const home = io_mod.getenv("HOME") orelse return writeFailed("home", error.HomeNotSet);
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
@@ -193,15 +195,29 @@ fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
     };
     defer fx_dir.close();
 
-    return storeInDir(alloc, &fx_dir, value);
+    return storeInDir(alloc, &fx_dir, profileFileName(slot), value);
 }
 
 /// `durableReplaceVerified` creates the file at 0600 and re-stats it after the rename,
 /// so the mode this store depends on is enforced rather than assumed.
-fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, value: []const u8) StoreError!void {
-    io_mod.durableReplaceVerified(alloc, fx_dir, profile_paths.api_key_file_name, value) catch |err| switch (err) {
+fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, file_name: []const u8, value: []const u8) StoreError!void {
+    io_mod.durableReplaceVerified(alloc, fx_dir, file_name, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return writeFailed("replace", err),
+    };
+}
+
+fn profileFileName(slot: host.SecretSlot) []const u8 {
+    return switch (slot) {
+        .gateway_api_key => profile_paths.api_key_file_name,
+        .cliproxyapi_api_key => profile_paths.cliproxyapi_api_key_file_name,
+    };
+}
+
+fn keychainService(slot: host.SecretSlot) []const u8 {
+    return switch (slot) {
+        .gateway_api_key => keychain.service_name,
+        .cliproxyapi_api_key => keychain.cliproxyapi_service_name,
     };
 }
 
@@ -228,15 +244,33 @@ test "stored key file round-trips byte-identically at mode 0600" {
     defer fx_dir.close();
 
     const written = "vt1-file-round-trip-value";
-    try storeInDir(std.testing.allocator, &fx_dir, written);
+    try storeInDir(std.testing.allocator, &fx_dir, profile_paths.api_key_file_name, written);
 
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
     try std.testing.expect(stat.permissions.toMode() & 0o777 == 0o600);
 
-    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
+    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name)) orelse
         return error.TestUnexpectedMissingStoredKey;
     defer secret.zeroAndFree(std.testing.allocator, read_back);
     try std.testing.expectEqualStrings(written, read_back);
+}
+
+test "provider API keys use separate profile files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fx_dir = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }),
+    };
+    defer fx_dir.close();
+
+    try storeInDir(std.testing.allocator, &fx_dir, profile_paths.api_key_file_name, "gateway-key");
+    try storeInDir(std.testing.allocator, &fx_dir, profile_paths.cliproxyapi_api_key_file_name, "cliproxy-key");
+    const gateway_key = (try loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name)).?;
+    defer secret.zeroAndFree(std.testing.allocator, gateway_key);
+    const cliproxy_key = (try loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.cliproxyapi_api_key_file_name)).?;
+    defer secret.zeroAndFree(std.testing.allocator, cliproxy_key);
+    try std.testing.expectEqualStrings("gateway-key", gateway_key);
+    try std.testing.expectEqualStrings("cliproxy-key", cliproxy_key);
 }
 
 test "stored key file refusal stays distinguishable from absence" {
@@ -247,9 +281,9 @@ test "stored key file refusal stays distinguishable from absence" {
     };
     defer fx_dir.close();
 
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name)) == null);
 
-    try storeInDir(std.testing.allocator, &fx_dir, "vt2-secret-value");
+    try storeInDir(std.testing.allocator, &fx_dir, profile_paths.api_key_file_name, "vt2-secret-value");
     for ([_]std.posix.mode_t{ 0o640, 0o604, 0o644 }) |mode| {
         var file = try tmp.dir.openFile(std.testing.io, profile_paths.api_key_file_name, .{ .mode = .read_write });
         try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(mode));
@@ -257,12 +291,12 @@ test "stored key file refusal stays distinguishable from absence" {
 
         try std.testing.expectError(
             error.StoredKeyInsecure,
-            loadFromDir(std.testing.allocator, &fx_dir.dir),
+            loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name),
         );
     }
 
     try tmp.dir.deleteFile(std.testing.io, profile_paths.api_key_file_name);
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name)) == null);
 }
 
 test "stored key file tolerates a trailing newline and rejects an empty value" {
@@ -273,14 +307,14 @@ test "stored key file tolerates a trailing newline and rejects an empty value" {
     };
     defer fx_dir.close();
 
-    try storeInDir(std.testing.allocator, &fx_dir, "hand-edited-value\n");
-    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
+    try storeInDir(std.testing.allocator, &fx_dir, profile_paths.api_key_file_name, "hand-edited-value\n");
+    const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name)) orelse
         return error.TestUnexpectedMissingStoredKey;
     defer secret.zeroAndFree(std.testing.allocator, read_back);
     try std.testing.expectEqualStrings("hand-edited-value", read_back);
 
-    try storeInDir(std.testing.allocator, &fx_dir, "\n\n");
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
+    try storeInDir(std.testing.allocator, &fx_dir, profile_paths.api_key_file_name, "\n\n");
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name)) == null);
 
-    try std.testing.expectError(error.StoredKeyWriteFailed, store(std.testing.allocator, ""));
+    try std.testing.expectError(error.StoredKeyWriteFailed, store(std.testing.allocator, .gateway_api_key, ""));
 }

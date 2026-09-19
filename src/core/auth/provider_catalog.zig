@@ -25,6 +25,16 @@ pub const entries = [_]Entry{
         .login_source = .fx_login,
     },
     .{
+        .id = .cliproxyapi,
+        .slug = "cliproxyapi",
+        .aliases = &.{"cli-proxy-api"},
+        .name = "CLIProxyAPI",
+        .route_name = "CLIProxyAPI",
+        .description = "Local CLIProxyAPI server",
+        .subscription = false,
+        .login_source = .cliproxyapi_stored_key,
+    },
+    .{
         .id = .codex,
         .slug = "codex",
         .name = "Codex",
@@ -75,6 +85,7 @@ pub fn label(id: model_provider.ProviderId) []const u8 {
 test "auth provider catalog uses the model provider identity and explicit aliases" {
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("vercel").?);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("gateway").?);
+    try std.testing.expectEqual(model_provider.ProviderId.cliproxyapi, parse("cliproxyapi").?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
     try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
     try std.testing.expect(parse("openai-codex") == null);

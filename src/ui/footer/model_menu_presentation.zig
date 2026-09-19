@@ -417,6 +417,8 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .ai_gateway_api_key => "Note: Gateway catalog is authenticated with an API key",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
+            .cliproxyapi_api_key => "CLIProxyAPI catalog: authenticated with FX_CLIPROXYAPI_KEY.",
+            .cliproxyapi_stored_key => "CLIProxyAPI catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
             .host_managed => "Provider catalog: authentication is managed by the host.",

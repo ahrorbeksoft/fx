@@ -5,6 +5,7 @@ const configured_provider = @import("configured_provider.zig");
 
 pub const ProviderId = union(enum) {
     gateway,
+    cliproxyapi,
     codex,
     grok,
     configured: struct {
@@ -17,6 +18,7 @@ pub const ProviderId = union(enum) {
     pub fn label(self: *const ProviderId) []const u8 {
         return switch (self.*) {
             .gateway => "gateway",
+            .cliproxyapi => "cliproxyapi",
             .codex => "codex",
             .grok => "grok",
             .configured => |*value| value.bytes[0..value.len],
@@ -105,6 +107,7 @@ pub const ProviderSelection = struct {
 
 pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
+    if (std.ascii.eqlIgnoreCase(value, "cliproxyapi")) return .cliproxyapi;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
     configured_provider.validate_id(value) catch return null;
@@ -135,7 +138,8 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
     const selected = source orelse return false;
     if (selected == .host_managed) return true;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .configured,
+        .gateway => selected == .vercel_oidc_token or selected == .ai_gateway_api_key or selected == .fx_login or selected == .stored_key,
+        .cliproxyapi => selected == .cliproxyapi_api_key or selected == .cliproxyapi_stored_key,
         .configured => selected == .configured,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
@@ -152,6 +156,10 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.grok, .grok_subscription));
     try std.testing.expect(!authorizesCredential(.grok, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
+    try std.testing.expect(!authorizesCredential(.gateway, .cliproxyapi_api_key));
+    try std.testing.expect(!authorizesCredential(.gateway, .cliproxyapi_stored_key));
+    try std.testing.expect(authorizesCredential(.cliproxyapi, .cliproxyapi_api_key));
+    try std.testing.expect(authorizesCredential(.cliproxyapi, .cliproxyapi_stored_key));
 }
 
 test "configured provider identity serializes its binding and rejects rebinding" {

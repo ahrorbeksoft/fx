@@ -96,18 +96,20 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .key_source => {
                     const view = app.auth.pickerView();
-                    // `current` always means "used for inference right now",
-                    // so a key is only current while the gateway is active.
-                    const active = if (active_provider == .gateway) app.auth.credentialSource() else null;
+                    const pending_provider = provider_catalog.parse(
+                        app.input_runtime.picker.provider_picker_pending_provider.items,
+                    ) orelse .gateway;
+                    const active = if (active_provider.eql(pending_provider)) app.auth.credentialSource() else null;
                     inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".fields) |field| {
                         const key_source = @field(provider_picker_catalog.KeySource, field.name);
-                        const credential = provider_picker_catalog.keySourceCredential(key_source);
+                        const credential = provider_picker_catalog.keySourceCredentialForProvider(key_source, pending_provider);
                         const detected = if (credential) |value| view.available_sources.contains(value) else true;
                         if (detected) {
                             column.labels[count] = provider_picker_catalog.keySourceSlug(key_source);
-                            column.annotations[count] = provider_picker_catalog.keySourceAnnotation(
+                            column.annotations[count] = provider_picker_catalog.keySourceAnnotationForProvider(
                                 key_source,
                                 credential != null and credential == active,
+                                pending_provider,
                             );
                             count += 1;
                         }
@@ -285,8 +287,10 @@ pub fn Runtime(comptime App: type) type {
                         // (or `new` to paste one); with none there is nothing
                         // to ask, so the paste field opens directly.
                         const view = app.auth.pickerView();
-                        if (view.available_sources.contains(.ai_gateway_api_key) or
-                            view.available_sources.contains(.stored_key))
+                        const env_source: credentials.Source = if (provider == .cliproxyapi) .cliproxyapi_api_key else .ai_gateway_api_key;
+                        const saved_source: credentials.Source = if (provider == .cliproxyapi) .cliproxyapi_stored_key else .stored_key;
+                        if (view.available_sources.contains(env_source) or
+                            view.available_sources.contains(saved_source))
                         {
                             try openKeyStage(app, query.prefix, .key_source);
                             return true;
@@ -340,7 +344,7 @@ pub fn Runtime(comptime App: type) type {
                     const pending_provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
-                    if (provider_picker_catalog.keySourceCredential(key_source)) |credential| {
+                    if (provider_picker_catalog.keySourceCredentialForProvider(key_source, pending_provider)) |credential| {
                         try commitSource(app, credential, pending_provider);
                     } else {
                         try openKeyStage(app, query.prefix, .api_key);
@@ -373,7 +377,10 @@ pub fn Runtime(comptime App: type) type {
 
             try setComposerText(app, "{s}{s} {s} ", .{ stable_prefix, provider_slug, method_slug });
             try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, provider_slug, method_slug, stage);
-            if (stage == .api_key) app.auth.openApiKeyPickerInline(app.alloc);
+            if (stage == .api_key) {
+                const provider = provider_catalog.parse(provider_slug) orelse .gateway;
+                app.auth.openApiKeyPickerInline(app.alloc, provider);
+            }
             app.shell.render_requests.request(.footer);
         }
 

@@ -42,19 +42,27 @@ fn bound_identity(definition: *const definitions.Definition) model_provider.Prov
 fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
     const definition = definition_at(raw);
     const identity = bound_identity(definition);
+    return buildForProvider(alloc, request, identity, definition.tool_choice_mode);
+}
+
+pub fn buildForProvider(alloc: Allocator, request: streams.RequestData, identity: model_provider.ProviderId, tool_choice_mode: definitions.ToolChoiceMode) ![]u8 {
     for (request.messages) |message| if (message.provider_replay) |replay| {
         if (!replay.matches(.{ .provider = identity, .model = request.model })) {
             debug_trace.logf("gateway", "provider_replay_omitted reason=source_mismatch", .{});
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{ .tool_choice_mode = tool_choice_mode, .provider = &identity });
 }
 
-fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+pub fn projectReplay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
     if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
     return selected;
+}
+
+fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+    return projectReplay(alloc, replay, calls, text, reasoning);
 }
 
 test "chat completions adapter binds replay to endpoint authority and wires projection" {
@@ -116,6 +124,32 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     };
 }
 
+pub fn streamAtBaseUrl(
+    alloc: Allocator,
+    request: streams.ModelRequest,
+    identity: model_provider.ProviderId,
+    base_url: []const u8,
+    env_source: types.CredentialSource,
+    stored_source: types.CredentialSource,
+) !streams.Result {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const source = request.credential.credentialSource();
+    if (source != env_source and source != stored_source and source != .host_managed) return error.ProviderCredentialRequired;
+    const token = request.credential.secret() orelse return error.MissingProviderCredential;
+    if (token.len > 16 * 1024) return error.InvalidProviderCredential;
+    for (token) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidProviderCredential;
+    const payload = request.prepared_request_body orelse try buildForProvider(alloc, request.data(), identity, .send);
+    defer if (request.prepared_request_body == null) alloc.free(payload);
+    const url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, base_url, "/")});
+    defer alloc.free(url);
+    return postUrl(alloc, url, request, token, payload) catch |err| {
+        request.attempt_evidence.network_failure = client_mod.networkFailureEvidence(err, request.delivery.load());
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (request.deadline) |deadline| if (expired(deadline)) return error.Timeout;
+        return err;
+    };
+}
+
 fn expired(deadline: std.Io.Clock.Timestamp) bool {
     return !std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io.getIo(), .awake), .lt, deadline);
 }
@@ -129,6 +163,10 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
+    return postUrl(alloc, url, request, token, payload);
+}
+
+fn postUrl(alloc: Allocator, url: []const u8, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };

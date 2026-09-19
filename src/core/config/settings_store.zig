@@ -1602,6 +1602,7 @@ fn putModelPreference(
     changed = try putString(arena, models, provider_key, preference.model) or changed;
     const legacy_key = switch (preference.provider) {
         .gateway => "model",
+        .cliproxyapi => return changed,
         .codex => "codex_model",
         .grok => "grok_model",
         .configured => return changed,

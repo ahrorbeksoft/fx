@@ -1373,6 +1373,7 @@ fn configuredProviderSelection(
     const provider = provider_override orelse settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
+        .cliproxyapi => return error.CLIProxyAPIModelNotSelected,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
         .configured => io_mod.getenv("FX_MODEL") orelse return error.ConfiguredModelNotSelected,

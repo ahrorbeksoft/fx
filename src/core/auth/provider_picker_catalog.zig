@@ -72,12 +72,18 @@ pub fn keySourceSlug(source: KeySource) []const u8 {
 
 /// Row annotation: where the key comes from, with `current` appended when it
 /// is the active credential.
-pub fn keySourceAnnotation(source: KeySource, current: bool) []const u8 {
+pub fn keySourceAnnotationForProvider(source: KeySource, current: bool, provider: model_provider.ProviderId) []const u8 {
     return switch (source) {
-        .env => if (current) "AI_GATEWAY_API_KEY · current" else "AI_GATEWAY_API_KEY",
+        .env => if (provider == .cliproxyapi)
+            if (current) "FX_CLIPROXYAPI_KEY · current" else "FX_CLIPROXYAPI_KEY"
+        else if (current) "AI_GATEWAY_API_KEY · current" else "AI_GATEWAY_API_KEY",
         .saved => if (current) "saved by fx · current" else "saved by fx",
         .new => "paste a key",
     };
+}
+
+pub fn keySourceAnnotation(source: KeySource, current: bool) []const u8 {
+    return keySourceAnnotationForProvider(source, current, .gateway);
 }
 
 pub fn parseKeySource(value: []const u8) ?KeySource {
@@ -88,12 +94,16 @@ pub fn parseKeySource(value: []const u8) ?KeySource {
     return null;
 }
 
-pub fn keySourceCredential(source: KeySource) ?types.CredentialSource {
+pub fn keySourceCredentialForProvider(source: KeySource, provider: model_provider.ProviderId) ?types.CredentialSource {
     return switch (source) {
-        .env => .ai_gateway_api_key,
-        .saved => .stored_key,
+        .env => if (provider == .cliproxyapi) .cliproxyapi_api_key else .ai_gateway_api_key,
+        .saved => if (provider == .cliproxyapi) .cliproxyapi_stored_key else .stored_key,
         .new => null,
     };
+}
+
+pub fn keySourceCredential(source: KeySource) ?types.CredentialSource {
+    return keySourceCredentialForProvider(source, .gateway);
 }
 
 pub fn methodSlug(method: Method) []const u8 {
@@ -128,6 +138,7 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
         .gateway => &.{ .oauth, .api_key },
+        .cliproxyapi => &.{.api_key},
         .codex, .grok, .configured => &.{},
     };
 }
@@ -137,7 +148,7 @@ pub fn providerMethods(id: model_provider.ProviderId) []const Method {
 pub fn methodMatchesSource(method: Method, source: types.CredentialSource) bool {
     return switch (method) {
         .oauth => source == .fx_login or source == .vercel_oidc_token,
-        .api_key => source == .ai_gateway_api_key or source == .stored_key,
+        .api_key => source == .ai_gateway_api_key or source == .stored_key or source == .cliproxyapi_api_key or source == .cliproxyapi_stored_key,
     };
 }
 
@@ -153,8 +164,10 @@ test "provider options expose the catalog slugs the composer accepts" {
     }
 }
 
-test "only the gateway offers a method column" {
+test "key providers offer API key methods" {
     try std.testing.expectEqual(@as(usize, 2), providerMethods(.gateway).len);
+    try std.testing.expectEqual(@as(usize, 1), providerMethods(.cliproxyapi).len);
+    try std.testing.expectEqual(Method.api_key, providerMethods(.cliproxyapi)[0]);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.codex).len);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.grok).len);
 }

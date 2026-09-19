@@ -1,11 +1,13 @@
 const std = @import("std");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
+const runtime_profile = @import("../core/hosts/runtime_profile.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const TopLevelKind = command_specs.TopLevelKind;
 pub const TopLevelSpec = command_specs.TopLevelSpec;
 pub const TopLevelHelpGroup = command_specs.TopLevelHelpGroup;
+pub const TopLevelHelpEntry = command_specs.TopLevelHelpEntry;
 pub const TopLevelFlag = command_specs.TopLevelFlag;
 pub const TopLevelExample = command_specs.TopLevelExample;
 pub const TopLevelResource = command_specs.TopLevelResource;
@@ -17,6 +19,13 @@ pub const SlashSpec = command_specs.SlashSpec;
 pub const SlashRegistry = command_specs.SlashRegistry;
 
 const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "Emit machine-readable JSON instead of text" };
+
+const upgrade_help_entry: [if (runtime_profile.native.auto_upgrade) 1 else 0]TopLevelHelpEntry =
+    if (runtime_profile.native.auto_upgrade) .{.{
+        .kind = .upgrade,
+        .usage = "upgrade",
+        .summary = "Upgrade fx on the selected release channel",
+    }} else .{};
 
 pub const top_level_specs = [_]TopLevelSpec{
     .{
@@ -249,6 +258,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "upgrade",
         .usage = "upgrade [--channel <stable|dev>] [--json]",
         .summary = "Upgrade 𝒇x on the selected release channel",
+        .hidden_from_top_level_help = !runtime_profile.native.auto_upgrade,
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,
@@ -317,16 +327,16 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]", .summary = "Show locally recorded token usage and spend" },
     } },
-    .{ .entries = &.{
+    .{ .entries = &([_]TopLevelHelpEntry{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
+    } ++ upgrade_help_entry ++ [_]TopLevelHelpEntry{
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
-    } },
+    }) },
 };
 
 pub const top_level_flags = [_]TopLevelFlag{
@@ -344,7 +354,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--provider <name>",
-        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
+        .description = "Override the model provider for an interactive session (gateway, cliproxyapi, codex, grok, or a configured name)",
     },
     .{
         .usage = "--model <id>",

@@ -634,6 +634,7 @@ const App = struct {
             app_secret_store,
             auth_mode,
         );
+        app.auth.setProviderApiKeyValidator(.cliproxyapi, @import("gateway/cliproxyapi.zig").key_validator);
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
         if (comptime host_profile.js_host_workspace) {
@@ -2001,7 +2002,7 @@ const App = struct {
     }
 
     pub fn providerSet(self: *const App) provider_set.Set {
-        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{} };
+        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .cliproxyapi = .{}, .codex = .{}, .grok = .{} };
         if (comptime host_target.is_wasm) {
             return provider_set.gateway_only(.{
                 .capabilities = .{
@@ -4330,6 +4331,9 @@ test {
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/gateway/model_catalog.zig");
     _ = @import("gateway/chat_completions.zig");
+    _ = @import("gateway/cliproxyapi.zig");
+    _ = @import("core/auth/provider_picker_catalog.zig");
+    _ = @import("core/hosts/native_secret_store.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");

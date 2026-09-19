@@ -15,7 +15,7 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 
 ## Highlights
 
-- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
+- **Any model:** Vercel AI Gateway, CLIProxyAPI, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
 - **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
 - **Extensible:** skills, MCP servers, and subagents
@@ -55,6 +55,8 @@ fx ask "explain the changes in this repository"
 ```
 
 Inside the shell, run `/help` to browse interactive commands.
+
+To use a local CLIProxyAPI server, run `/provider`, choose `cliproxyapi`, then choose `api-key`. fx discovers models and reasoning levels from `http://localhost:8317/v1` and saves a pasted key in the platform credential store. Set `FX_CLIPROXYAPI_KEY` to use an environment key or `FX_CLIPROXYAPI_BASE_URL` to override the server URL.
 
 ## Documentation
 

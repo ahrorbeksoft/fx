@@ -73,6 +73,7 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
                 facts.available_sources.contains(.stored_key),
             .codex => facts.available_sources.contains(.chatgpt_subscription),
             .grok => facts.available_sources.contains(.grok_subscription),
+            .cliproxyapi => false,
             .configured => false,
         };
         if (!available) continue;
@@ -148,6 +149,7 @@ pub fn signInCompletion(
 ) SignInCompletionAction {
     return switch (provider) {
         .gateway => .vercel,
+        .cliproxyapi => .{ .switch_provider = provider },
         .configured => .{ .switch_provider = provider },
         .codex => if (provider_routing_supported)
             .{ .switch_provider = .codex }

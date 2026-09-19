@@ -291,7 +291,7 @@ pub fn validate_id(id: []const u8) error{ LimitExceeded, InvalidProviderId, Rese
     for (id) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return error.InvalidProviderId;
     }
-    for ([_][]const u8{ "gateway", "codex", "grok" }) |reserved| {
+    for ([_][]const u8{ "gateway", "cliproxyapi", "codex", "grok" }) |reserved| {
         if (std.ascii.eqlIgnoreCase(id, reserved)) return error.ReservedProviderId;
     }
 }

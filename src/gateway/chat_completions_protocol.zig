@@ -165,7 +165,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
     // content on user and tool-result messages serializes natively below.
@@ -601,6 +601,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    if (request.provider_options.reasoning) |*effort| {
+        if (effort.gatewayValue()) |value| {
+            try writer.writeAll(",\"reasoning_effort\":");
+            try std.json.Stringify.value(value, .{}, writer);
+        }
+    }
     try writer.writeByte('}');
 }
 
@@ -2024,8 +2030,6 @@ test "chat completions serializes user message images as content parts" {
 test "chat completions rejects unsupported requests and ambiguous selection" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.provider_options.reasoning = .auto;
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .fast = true };
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .prompt_caching = true };
@@ -2056,6 +2060,24 @@ test "chat completions rejects unsupported requests and ambiguous selection" {
     request = test_request();
     request.tools.additional_functions = &.{ test_functions[0], test_functions[0] };
     try std.testing.expectError(error.InvalidToolSelection, build_request(alloc, request, .{}));
+}
+
+test "chat completions serializes selected reasoning effort" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    request.provider_options.reasoning = types.ReasoningEffort.literal("high");
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("high", parsed.value.object.get("reasoning_effort").?.string);
+
+    request.provider_options.reasoning = .auto;
+    const default_body = try build_request(alloc, request, .{});
+    defer alloc.free(default_body);
+    var parsed_default = try std.json.parseFromSlice(std.json.Value, alloc, default_body, .{});
+    defer parsed_default.deinit();
+    try std.testing.expect(parsed_default.value.object.get("reasoning_effort") == null);
 }
 
 test "chat completions rejects unmatched native malformed and duplicate history calls" {

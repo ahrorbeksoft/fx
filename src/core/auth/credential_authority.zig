@@ -25,6 +25,8 @@ pub fn derive(
         .ai_gateway_api_key,
         .fx_login,
         .stored_key,
+        .cliproxyapi_api_key,
+        .cliproxyapi_stored_key,
         .host_managed,
         .configured,
         => hash.update("\x00slot\x00"),

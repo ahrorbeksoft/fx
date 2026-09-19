@@ -21,6 +21,7 @@ const FindGenericPasswordFn = *const fn (
 ) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
+pub const cliproxyapi_service_name = "FX_CLIPROXYAPI_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
@@ -150,10 +151,18 @@ pub fn load(alloc: std.mem.Allocator) !?[]u8 {
     return loadFromService(alloc, service_name);
 }
 
+pub fn loadService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
+    return loadFromService(alloc, service);
+}
+
 /// Checks Keychain metadata only. It never asks Security.framework for the
 /// secret value and never spawns the `security` command-line tool.
 pub fn contains() Error!host.SecretStorePresence {
     return containsService(service_name);
+}
+
+pub fn containsServiceName(service: []const u8) Error!host.SecretStorePresence {
+    return containsService(service);
 }
 
 pub fn oauthSessionPresence() Error!host.SecretStorePresence {
@@ -372,6 +381,13 @@ pub fn storeValue(value: []const u8) Error!void {
     if (value.len == 0) return error.KeychainWriteFailed;
 
     if (comptime builtin.os.tag == .macos) return storeValueMac(service_name, value);
+    return error.UnsupportedPlatform;
+}
+
+pub fn storeServiceValue(service: []const u8, value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0) return error.KeychainWriteFailed;
+    if (comptime builtin.os.tag == .macos) return storeValueMac(service, value);
     return error.UnsupportedPlatform;
 }
 

@@ -22,6 +22,7 @@ const execution_process_provider = @import("../execution/process_provider.zig");
 const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -757,6 +758,7 @@ fn activateProviderSelection(
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .cliproxyapi => return error.ApiKeyProviderUsesProviderPicker,
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
@@ -836,6 +838,7 @@ fn activateProviderSelectionFallible(
     {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
+            .cliproxyapi => "CLIProxyAPI is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
             .configured => "Configured provider is already selected.\n",
@@ -872,6 +875,7 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .cliproxyapi => "configure a CLIProxyAPI key first",
                 .configured => "configure the provider auth environment variable first",
             },
         );
@@ -882,6 +886,7 @@ fn activateProviderSelectionFallible(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .cliproxyapi => "CLIProxyAPI model catalog is unavailable",
             .configured => "Configured model catalog is unavailable",
         });
         return false;
@@ -949,11 +954,12 @@ fn activateProviderSelectionFallible(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway, .configured => unreachable,
+        .gateway, .cliproxyapi, .configured => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
+            .cliproxyapi => "Provider set to CLIProxyAPI.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
             .configured => "Provider set to configured connection.\n",
@@ -1104,6 +1110,7 @@ fn runNonInteractiveWithDeps(
             )) return .handled_failure;
             try writeStdout(deps, switch (login_provider) {
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
+                .cliproxyapi => "CLIProxyAPI uses an API key. Start fx and run /provider to add one.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
                 .configured => "Configured providers use settings.json authentication.\n",
@@ -1249,7 +1256,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
+                try writeStderr(deps, "fx provider: expected gateway, cliproxyapi, codex, grok, or a configured name\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1370,6 +1377,7 @@ fn runNonInteractiveWithDeps(
             const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
+                    .cliproxyapi => "fx models: CLIProxyAPI model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
                     .configured => "fx models: Configured model catalog is unavailable\n",
@@ -1793,11 +1801,19 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .upgrade => |rest| {
-            const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
             const opts = parseUpgradeArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .upgrade, "upgrade", err, rest);
                 return .handled_failure;
             };
+            if (comptime !runtime_profile.native.auto_upgrade) {
+                if (opts.format == .json) {
+                    try writeJsonCommandFailureCode(alloc, deps, "upgrade", "upgrade_disabled", "upgrade is unavailable in this build");
+                } else {
+                    try writeStderr(deps, "fx upgrade: unavailable in this build\n");
+                }
+                return .handled_failure;
+            }
+            const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
 
             var startup = deps.load_startup_state_without_credentials(
                 alloc,
@@ -1968,7 +1984,7 @@ fn runPasteSetup(
     }
 
     try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
-    const stored_interactively = secret_store.storeInteractive() catch {
+    const stored_interactively = secret_store.storeInteractive(.gateway_api_key) catch {
         try writeStderr(deps, "\nfx setup: API key was not saved\n");
         return false;
     };
@@ -1984,7 +2000,7 @@ fn runPasteSetup(
         };
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
-        secret_store.store(alloc, key) catch {
+        secret_store.store(alloc, .gateway_api_key, key) catch {
             try writeStderr(deps, "fx setup: API key was not saved\n");
             return false;
         };
@@ -3337,7 +3353,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
         error.ConflictingFastFlags => "--fast and --no-fast cannot be used together",
         error.MissingProviderValue => "--provider requires a provider name",
-        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
+        error.InvalidProviderValue => "--provider accepts gateway, cliproxyapi, codex, grok, or a configured provider name",
         else => null,
     };
 }
@@ -5604,6 +5620,7 @@ fn captureSecretStoreIsDisabled(ctx: ?*anyopaque) bool {
 fn captureSecretStoreLoad(
     _: ?*anyopaque,
     _: Allocator,
+    _: host.SecretSlot,
 ) host.SecretStoreLoadError!?[]u8 {
     return null;
 }
@@ -5611,6 +5628,7 @@ fn captureSecretStoreLoad(
 fn captureSecretStoreWrite(
     ctx: ?*anyopaque,
     _: Allocator,
+    _: host.SecretSlot,
     value: []const u8,
 ) host.SecretStoreWriteError!void {
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
@@ -5620,6 +5638,7 @@ fn captureSecretStoreWrite(
 
 fn captureSecretStoreInteractiveWrite(
     ctx: ?*anyopaque,
+    _: host.SecretSlot,
 ) host.SecretStoreWriteError!bool {
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
     if (!capture.setup_interactive_store) return false;

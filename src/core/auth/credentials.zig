@@ -62,6 +62,8 @@ pub const CatalogAuthenticatedSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    cliproxyapi_api_key,
+    cliproxyapi_stored_key,
     chatgpt_subscription,
     grok_subscription,
 
@@ -71,6 +73,8 @@ pub const CatalogAuthenticatedSource = enum {
             .ai_gateway_api_key => .ai_gateway_api_key,
             .fx_login => .fx_login,
             .stored_key => .stored_key,
+            .cliproxyapi_api_key => .cliproxyapi_api_key,
+            .cliproxyapi_stored_key => .cliproxyapi_stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
         };
@@ -218,6 +222,8 @@ pub fn catalogAccessForCredentialAndAccount(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .cliproxyapi_api_key => .cliproxyapi_api_key,
+        .cliproxyapi_stored_key => .cliproxyapi_stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
         .host_managed => unreachable,
@@ -390,6 +396,19 @@ pub fn resolveForProvider(
             .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
         };
     }
+    if (provider == .cliproxyapi) {
+        const source: Source = if (preferred == .cliproxyapi_api_key or preferred == .cliproxyapi_stored_key)
+            preferred.?
+        else if (nonEmptyEnvValue("FX_CLIPROXYAPI_KEY") != null)
+            .cliproxyapi_api_key
+        else
+            .cliproxyapi_stored_key;
+        const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{ .failure = .{ .source = source, .err = err } };
+        };
+        return .{ .credential = credential };
+    }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
         const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
@@ -399,12 +418,13 @@ pub fn resolveForProvider(
         };
         return .{ .credential = credential };
     }
+    const authorized_preferred: ?Source = if (model_provider.authorizesCredential(.gateway, preferred)) preferred else null;
     return resolvePreferring(
         alloc,
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        authorized_preferred,
     );
 }
 
@@ -519,6 +539,7 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
+        .cliproxyapi_api_key, .cliproxyapi_stored_key => loadSource(alloc, transport, secret_store, source),
         else => loadSource(alloc, transport, secret_store, source),
     };
 }
@@ -532,8 +553,9 @@ pub fn loadSource(
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+        .cliproxyapi_api_key => loadEnvCredential(alloc, "FX_CLIPROXYAPI_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
-        .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .stored_key, .cliproxyapi_stored_key => loadStoredKeyCredential(alloc, secret_store, source),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
         .host_managed, .configured => null,
@@ -549,6 +571,7 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .cliproxyapi_api_key => nonEmptyEnvValue("FX_CLIPROXYAPI_KEY") != null,
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -575,9 +598,9 @@ pub fn sourceExists(
                 break :blk false;
             },
         },
-        .stored_key => blk: {
+        .stored_key, .cliproxyapi_stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
-            break :blk switch (secret_store.presence()) {
+            break :blk switch (secret_store.presence(secretSlot(source))) {
                 .present => true,
                 .missing => false,
                 .unavailable => {
@@ -607,11 +630,15 @@ pub fn sourcePresence(
             .present
         else
             .missing,
+        .cliproxyapi_api_key => if (nonEmptyEnvValue("FX_CLIPROXYAPI_KEY") != null)
+            .present
+        else
+            .missing,
         .fx_login => oauth_session.presence(),
-        .stored_key => if (secret_store.isDisabled())
+        .stored_key, .cliproxyapi_stored_key => if (secret_store.isDisabled())
             .missing
         else
-            secret_store.presence(),
+            secret_store.presence(secretSlot(source)),
         .chatgpt_subscription => chatgpt_session.presence(),
         .grok_subscription => grok_session.presence(),
         .host_managed, .configured => .missing,
@@ -651,10 +678,19 @@ fn loadEnvCredential(
 fn loadStoredKeyCredential(
     alloc: std.mem.Allocator,
     secret_store: host.SecretStore,
+    source: Source,
 ) !?Credential {
     if (secret_store.isDisabled()) return null;
-    const value = (try secret_store.load(alloc)) orelse return null;
-    return .{ .token = value, .source = .stored_key };
+    const value = (try secret_store.load(alloc, secretSlot(source))) orelse return null;
+    return .{ .token = value, .source = source };
+}
+
+pub fn secretSlot(source: Source) host.SecretSlot {
+    return switch (source) {
+        .stored_key => .gateway_api_key,
+        .cliproxyapi_stored_key => .cliproxyapi_api_key,
+        else => unreachable,
+    };
 }
 
 fn loadChatGptCredential(
@@ -910,6 +946,8 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .cliproxyapi_api_key => "FX_CLIPROXYAPI_KEY",
+        .cliproxyapi_stored_key => "stored CLIProxyAPI key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
         .host_managed => "host managed",
@@ -1178,7 +1216,7 @@ const SecretStoreFixture = struct {
         return self.disabled;
     }
 
-    fn presence(raw_context: ?*anyopaque) host.SecretStorePresence {
+    fn presence(raw_context: ?*anyopaque, _: host.SecretSlot) host.SecretStorePresence {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         self.presence_calls += 1;
         if (self.unreadable) return .unavailable;
@@ -1188,6 +1226,7 @@ const SecretStoreFixture = struct {
     fn load(
         raw_context: ?*anyopaque,
         alloc: std.mem.Allocator,
+        _: host.SecretSlot,
     ) host.SecretStoreLoadError!?[]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         self.load_calls += 1;
@@ -1199,6 +1238,7 @@ const SecretStoreFixture = struct {
     fn store(
         _: ?*anyopaque,
         _: std.mem.Allocator,
+        _: host.SecretSlot,
         _: []const u8,
     ) host.SecretStoreWriteError!void {
         return error.StoredKeyWriteFailed;
@@ -1206,6 +1246,7 @@ const SecretStoreFixture = struct {
 
     fn storeInteractive(
         _: ?*anyopaque,
+        _: host.SecretSlot,
     ) host.SecretStoreWriteError!bool {
         return false;
     }

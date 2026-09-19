@@ -53,6 +53,7 @@ fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
 
 pub const Set = struct {
     gateway: Bundle,
+    cliproxyapi: Bundle = .{},
     codex: Bundle,
     grok: Bundle,
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
@@ -61,6 +62,7 @@ pub const Set = struct {
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
+            .cliproxyapi => self.cliproxyapi,
             .codex => self.codex,
             .grok => self.grok,
             .configured => blk: {
@@ -75,6 +77,7 @@ pub const Set = struct {
     pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
         return .{
             .gateway = self.gateway.deferred_usage,
+            .cliproxyapi = self.cliproxyapi.deferred_usage,
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
         };
@@ -84,6 +87,7 @@ pub const Set = struct {
 pub fn gateway_only(gateway: Bundle) Set {
     return .{
         .gateway = gateway,
+        .cliproxyapi = .{},
         .codex = .{},
         .grok = .{},
     };
@@ -91,6 +95,7 @@ pub fn gateway_only(gateway: Bundle) Set {
 
 test "provider set selects each provider's complete route" {
     var gateway_tag: u8 = 0;
+    var cliproxyapi_tag: u8 = 0;
     var codex_tag: u8 = 0;
     var grok_tag: u8 = 0;
 
@@ -147,6 +152,12 @@ test "provider set selects each provider's complete route" {
         .model_catalog = .{ .context = &codex_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &codex_tag, .review_fn = Fake.review },
     };
+    const cliproxyapi = Bundle{
+        .agent_stream = stream_provider.Provider{
+            .context = &cliproxyapi_tag,
+            .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        },
+    };
     const grok = Bundle{
         .agent_stream = stream_provider.Provider{
             .context = &grok_tag,
@@ -156,9 +167,10 @@ test "provider set selects each provider's complete route" {
         .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
     };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
+    var providers = Set{ .gateway = gateway, .cliproxyapi = cliproxyapi, .codex = codex, .grok = grok };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(providers.select(.cliproxyapi).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&cliproxyapi_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
     try std.testing.expect(providers.select(.gateway).capabilities.vision_fallback);
     try std.testing.expect(providers.select(.gateway).deferred_usage != null);
