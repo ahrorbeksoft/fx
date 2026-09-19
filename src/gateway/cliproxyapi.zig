@@ -103,7 +103,10 @@ fn getModels(alloc: Allocator, credential: []const u8) !Response {
 }
 
 fn validateKey(_: ?*anyopaque, alloc: Allocator, key: []const u8) api_key_validator.Result {
-    var response = getModels(alloc, key) catch return .unavailable;
+    var response = getModels(alloc, key) catch |err| switch (err) {
+        error.InvalidCredential => return .refused,
+        else => return .unavailable,
+    };
     defer response.deinit(alloc);
     return if (response.status == .ok) .accepted else if (response.status == .unauthorized or response.status == .forbidden) .refused else .unavailable;
 }
@@ -112,8 +115,13 @@ fn fetchCatalog(_: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInpu
     if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     const credential = input.access.authorizationCredential() orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    var response = getModels(alloc, credential) catch
-        return .{ .failure = .{ .category = .transport, .retryable = true } };
+    var response = getModels(alloc, credential) catch |err| switch (err) {
+        error.InvalidCredential => return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } },
+        error.UnsupportedUriScheme => return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } },
+        error.CatalogTooLarge => return .{ .failure = .{ .category = .resource_exhausted, .retryable = false } },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = .{ .category = .transport, .retryable = true } },
+    };
     defer response.deinit(alloc);
     if (response.status != .ok) return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     return .{ .catalog = parseCatalog(alloc, response.body) catch |err| switch (err) {
@@ -147,45 +155,60 @@ fn parseCatalog(alloc: Allocator, body: []const u8) !std.ArrayList(model_catalog
     var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &entries);
     for (models.array.items) |model| {
-        if (model != .object) return error.InvalidCatalog;
-        const slug = model.object.get("slug") orelse continue;
-        const visibility = model.object.get("visibility") orelse continue;
-        const supported = model.object.get("supported_in_api") orelse continue;
-        if (slug != .string or visibility != .string or supported != .bool) return error.InvalidCatalog;
-        if (!std.mem.eql(u8, visibility.string, "list") or !supported.bool or !validModelId(slug.string)) continue;
-        const id = try alloc.dupe(u8, slug.string);
-        errdefer alloc.free(id);
-        const model_type = try alloc.dupe(u8, "language");
-        errdefer alloc.free(model_type);
-        var entry: model_catalog.ModelCatalogEntry = .{
-            .id = id,
-            .model_type = model_type,
-            .has_tool_use = true,
-            .has_implicit_caching = true,
+        const entry = parseModelEntry(alloc, model) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
         };
-        errdefer entry.reasoning_efforts.deinit(alloc);
-        try parseReasoningEfforts(alloc, &entry, model.object.get("supported_reasoning_levels"));
-        entry.context_window = try positiveU32(model.object.get("context_window"));
-        entry.max_tokens = try positiveU32(model.object.get("max_tokens"));
-        const vision = try stringArrayContains(model.object.get("input_modalities"), "image");
-        entry.has_vision = vision;
-        entry.has_file_input = vision;
-        try entries.append(alloc, entry);
+        if (entry) |value| try entries.append(alloc, value);
     }
     return entries;
 }
 
+fn parseModelEntry(alloc: Allocator, model: std.json.Value) !?model_catalog.ModelCatalogEntry {
+    if (model != .object) return null;
+    const slug = model.object.get("slug") orelse return null;
+    const visibility = model.object.get("visibility") orelse return null;
+    const supported = model.object.get("supported_in_api") orelse return null;
+    if (slug != .string or visibility != .string or supported != .bool) return null;
+    if (!std.mem.eql(u8, visibility.string, "list") or !supported.bool or !validModelId(slug.string)) return null;
+    const id = try alloc.dupe(u8, slug.string);
+    errdefer alloc.free(id);
+    const model_type = try alloc.dupe(u8, "language");
+    errdefer alloc.free(model_type);
+    var entry: model_catalog.ModelCatalogEntry = .{
+        .id = id,
+        .model_type = model_type,
+        .has_tool_use = true,
+        .has_implicit_caching = true,
+    };
+    errdefer entry.reasoning_efforts.deinit(alloc);
+    try parseReasoningEfforts(alloc, &entry, model.object.get("supported_reasoning_levels"));
+    entry.context_window = try positiveU32(model.object.get("context_window"));
+    entry.max_tokens = try positiveU32(model.object.get("max_tokens"));
+    const vision = try stringArrayContains(model.object.get("input_modalities"), "image");
+    entry.has_vision = vision;
+    entry.has_file_input = vision;
+    return entry;
+}
+
 fn parseReasoningEfforts(alloc: Allocator, entry: *model_catalog.ModelCatalogEntry, value: ?std.json.Value) !void {
     const levels = value orelse return;
-    if (levels != .array or levels.array.items.len > types.ReasoningEffort.max_options) return error.InvalidCatalog;
-    for (levels.array.items) |level| {
-        if (level != .object) return error.InvalidCatalog;
-        const raw = level.object.get("effort") orelse return error.InvalidCatalog;
-        if (raw != .string) return error.InvalidCatalog;
-        if (std.mem.eql(u8, raw.string, "ultra")) continue;
-        const effort = types.ReasoningEffort.parse(raw.string) orelse return error.InvalidCatalog;
+    if (levels != .array) return;
+    for (levels.array.items[0..@min(levels.array.items.len, types.ReasoningEffort.max_options)]) |level| {
+        if (level != .object) continue;
+        const raw = level.object.get("effort") orelse continue;
+        if (raw != .string) continue;
+        if (std.ascii.eqlIgnoreCase(raw.string, "ultra")) continue;
+        const effort = types.ReasoningEffort.parse(raw.string) orelse continue;
         if (effort.isDefault()) continue;
-        for (entry.reasoning_efforts.items) |existing| if (existing.eql(effort)) return error.InvalidCatalog;
+        var duplicate = false;
+        for (entry.reasoning_efforts.items) |existing| {
+            if (existing.eql(effort)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
         try entry.reasoning_efforts.append(alloc, effort);
     }
     entry.has_reasoning = entry.reasoning_efforts.items.len > 0;

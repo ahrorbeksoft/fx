@@ -393,6 +393,8 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
     try validate_request(input);
+    const reasoning_supported = options.provider != null and options.provider.?.* == .cliproxyapi;
+    if (input.provider_options.reasoning != null and !reasoning_supported) return error.UnsupportedProviderOption;
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
