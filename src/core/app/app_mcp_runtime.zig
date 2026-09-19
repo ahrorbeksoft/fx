@@ -1723,6 +1723,11 @@ pub const State = struct {
     pub fn takeStartupHealthNotice(self: *State, alloc: Allocator) !?[]u8 {
         if (!self.startup_health_notice_pending) return null;
         var lease = self.acquire() orelse {
+            debug_trace.logf(
+                "mcp",
+                "dropping startup health notice: runtime unavailable",
+                .{},
+            );
             self.startup_health_notice_pending = false;
             return null;
         };
@@ -3366,4 +3371,31 @@ test "model catalog baseline reports removals" {
     defer if (removed) |notice| alloc.free(notice);
     try std.testing.expect(removed != null);
     try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
+}
+
+test "startup health notice is held during discovery and consumed once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    state.installInitial(runtime);
+    defer state.deinit(alloc);
+
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
+
+    state.startDiscovery(.{});
+    try std.testing.expect(state.startup_health_notice_pending);
+
+    // Zero configured servers settle quickly; until then the notice is held.
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    var notice: ?[]u8 = null;
+    while (io_mod.milliTimestamp() < deadline) {
+        notice = try state.takeStartupHealthNotice(alloc);
+        if (!state.startup_health_notice_pending) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), notice);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
 }
