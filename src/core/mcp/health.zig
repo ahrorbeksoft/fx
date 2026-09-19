@@ -451,9 +451,10 @@ pub fn renderStartupNotice(alloc: Allocator, snapshot: Snapshot) !?[]u8 {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.print("MCP startup: {d} server{s} need attention", .{
+    try out.writer.print("MCP startup: {d} server{s} need{s} attention", .{
         needs_auth + failed,
         if (needs_auth + failed == 1) "" else "s",
+        if (needs_auth + failed == 1) "s" else "",
     });
     if (needs_auth > 0) {
         try out.writer.print(", {d} need{s} authentication", .{
@@ -762,5 +763,13 @@ test "renderStartupNotice names needs-auth servers and stays quiet when healthy"
     try std.testing.expectEqualStrings(
         "MCP startup: 2 servers need attention, 1 needs authentication, 1 failed. Run /mcp auth linear --open. Use /mcp list for details.",
         notice,
+    );
+
+    var single_servers = [_]ServerSnapshot{broken};
+    const single = (try renderStartupNotice(alloc, .{ .captured_at_ms = 0, .servers = &single_servers })).?;
+    defer alloc.free(single);
+    try std.testing.expectEqualStrings(
+        "MCP startup: 1 server needs attention, 1 failed. Use /mcp list for details.",
+        single,
     );
 }
