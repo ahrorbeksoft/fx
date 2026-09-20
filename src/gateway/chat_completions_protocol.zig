@@ -924,9 +924,16 @@ pub const Reducer = struct {
         if (total) |tokens| {
             const sum = std.math.add(u64, usage.input_tokens orelse 0, usage.output_tokens orelse 0) catch return error.InvalidChunk;
             const exact = (incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output);
+            const input_extra = try detail_tokens(fields, "prompt_tokens_details");
+            const output_extra = try detail_tokens(fields, "completion_tokens_details");
             if (incoming_total != null or final_fields.total) {
-                if (tokens < sum or (exact and tokens != sum)) return error.InvalidChunk;
-            } else if (exact and sum < tokens) return error.InvalidChunk;
+                if (tokens < sum) return error.InvalidChunk;
+                // Detail counters are billed within their parent counter per the
+                // schema or within total_tokens alone by some providers; either
+                // convention is consistent when the gap matches a subset of them.
+                const gap = tokens - sum;
+                if (exact and gap != 0 and gap != input_extra and gap != output_extra and gap != input_extra +| output_extra) return error.InvalidChunk;
+            } else if (exact and sum +| input_extra +| output_extra < tokens) return error.InvalidChunk;
         }
         for (
             [_]?u64{ self.usage.input_tokens, self.usage.output_tokens, self.usage_total },
@@ -1032,6 +1039,18 @@ fn integer(value: std.json.Value) Error!i64 {
 
 fn index_value(value: std.json.Value) Error!usize {
     return std.math.cast(usize, try integer(value)) orelse error.InvalidChunk;
+}
+
+fn detail_tokens(fields: std.json.ObjectMap, key: []const u8) Error!u64 {
+    const details = non_null(fields, key) orelse return 0;
+    var sum: u64 = 0;
+    var iterator = (try object(details)).iterator();
+    while (iterator.next()) |entry| {
+        if (!std.mem.endsWith(u8, entry.key_ptr.*, "_tokens")) continue;
+        const count = std.math.cast(u64, try integer(entry.value_ptr.*)) orelse return error.InvalidChunk;
+        sum = std.math.add(u64, sum, count) catch return error.InvalidChunk;
+    }
+    return sum;
 }
 
 fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
@@ -1686,6 +1705,38 @@ test "chat completions final output alone permits later final input enrichment" 
     try std.testing.expectEqual(@as(?u64, 3), reducer.usage.output_tokens);
     try std.testing.expectEqual(@as(?u64, 14), reducer.usage_total);
     try std.testing.expectError(error.ConflictingIdentity, test_usage_snapshot(&reducer, "{\"prompt_tokens\":12,\"total_tokens\":15}"));
+}
+
+test "chat completions usage accepts detail counters billed within total alone" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":60,\"completion_tokens\":16,\"total_tokens\":116,\"completion_tokens_details\":{\"reasoning_tokens\":40}}");
+    try test_accept(&reducer, test_stop);
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":60,\"completion_tokens\":16,\"total_tokens\":116,\"completion_tokens_details\":{\"reasoning_tokens\":40}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 60), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 16), result.completed.completion.usage.output_tokens);
+    var mixed = try Reducer.init(alloc, test_request(), .{});
+    defer mixed.deinit();
+    try test_usage_snapshot(&mixed, "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":2}}");
+    try test_usage_snapshot(&mixed, "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}");
+    var carried = try Reducer.init(alloc, test_request(), .{});
+    defer carried.deinit();
+    try test_usage_snapshot(&carried, "{\"total_tokens\":15}");
+    try test_usage_snapshot(&carried, "{\"prompt_tokens\":10,\"completion_tokens\":3,\"completion_tokens_details\":{\"reasoning_tokens\":2}}");
+    try std.testing.expectError(error.InvalidChunk, test_usage_snapshot(&carried, "{\"prompt_tokens\":10,\"completion_tokens\":3}"));
+    for ([_][]const u8{
+        "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":16,\"completion_tokens_details\":{\"reasoning_tokens\":2}}",
+        "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13,\"completion_tokens_details\":{\"reasoning_tokens\":-1}}",
+        "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13,\"completion_tokens_details\":\"bad\"}",
+    }) |usage| {
+        var invalid = try Reducer.init(alloc, test_request(), .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidChunk, test_usage_snapshot(&invalid, usage));
+    }
 }
 
 test "chat completions progress totals constrain current assertions rather than stale equality" {
