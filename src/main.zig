@@ -4,6 +4,8 @@ const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
 pub const version = "0.0.10";
+pub const fork_tag = "+cliproxyapi";
+pub const display_version = version ++ fork_tag;
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -383,13 +385,13 @@ const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPoli
 fn currentBuild() update_target.CurrentBuild {
     return .{
         .channel = compiled_update_channel,
-        .version = version,
+        .version = display_version,
         .revision = build_options.git_commit,
     };
 }
 
 const App = struct {
-    pub const app_version = version;
+    pub const app_version = display_version;
     pub const host_profile = selected_host_profile;
     pub const input_limits = paste_framing.default_input_limits;
     pub const build_update_channel = compiled_update_channel;
@@ -3796,7 +3798,7 @@ test "native app preserves the built-in tool set without workspace metadata" {
 
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
-        .version = version,
+        .version = display_version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
@@ -3835,7 +3837,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
 
 fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
-        .version = version,
+        .version = display_version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
@@ -3874,7 +3876,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
 
 fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
-        .version = version,
+        .version = display_version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,

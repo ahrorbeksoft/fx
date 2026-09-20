@@ -179,7 +179,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
     const build_label = try writeBuildLabel(
         &label_buf,
         build_channel,
-        main.version,
+        main.display_version,
         build_options.git_commit,
     );
     return std.fmt.allocPrint(
@@ -736,13 +736,13 @@ test "terminal title writes the label to the caller's output file" {
 
     // A host that redirects its output keeps the escape sequence off the
     // real stdout, which the Zig test runner owns as its protocol channel.
-    terminalTitleFor(&sink).set("fx v" ++ main.version ++ " | fx");
+    terminalTitleFor(&sink).set("fx v" ++ main.display_version ++ " | fx");
 
     var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
     defer written_file.close(io_mod.getIo());
     const written = try io_mod.readFileToEnd(alloc, &written_file, 128);
     defer alloc.free(written);
-    try std.testing.expectEqualStrings("\x1b]2;fx v" ++ main.version ++ " | fx\x07", written);
+    try std.testing.expectEqualStrings("\x1b]2;fx v" ++ main.display_version ++ " | fx\x07", written);
 }
 
 test "terminal title sanitizes and bounds untrusted labels" {
@@ -871,7 +871,7 @@ test "welcomeMessage shows version and help hint" {
     defer std.testing.allocator.free(message);
 
     try std.testing.expect(std.mem.find(u8, message, "𝒇x") != null);
-    try std.testing.expect(std.mem.find(u8, message, main.version) != null);
+    try std.testing.expect(std.mem.find(u8, message, main.display_version) != null);
     try std.testing.expect(std.mem.find(u8, message, "/help") != null);
 }
 
@@ -884,7 +884,7 @@ test "welcomeMessage keeps only the app name bright" {
     const build_label = try writeBuildLabel(
         &label_buf,
         build_channel,
-        main.version,
+        main.display_version,
         build_options.git_commit,
     );
     const expected = try std.fmt.allocPrint(

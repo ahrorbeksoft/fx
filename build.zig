@@ -423,6 +423,16 @@ fn readAppVersion(b: *std.Build) []const u8 {
         @panic("could not find pub const version in src/main.zig")) + prefix.len;
     const end_rel = std.mem.findScalar(u8, bytes[start..], '"') orelse
         @panic("could not parse pub const version in src/main.zig");
-    return b.allocator.dupe(u8, bytes[start .. start + end_rel]) catch
+    const version = bytes[start .. start + end_rel];
+
+    const tag_prefix = "pub const fork_tag = \"";
+    if (std.mem.find(u8, bytes, tag_prefix)) |tag_start| {
+        const begin = tag_start + tag_prefix.len;
+        const tag_len = std.mem.findScalar(u8, bytes[begin..], '"') orelse
+            @panic("could not parse pub const fork_tag in src/main.zig");
+        return std.fmt.allocPrint(b.allocator, "{s}{s}", .{ version, bytes[begin .. begin + tag_len] }) catch
+            @panic("could not allocate app version");
+    }
+    return b.allocator.dupe(u8, version) catch
         @panic("could not allocate app version");
 }
