@@ -675,6 +675,8 @@ const App = struct {
                 .model = launch.modifiers.model_override,
                 .effort = launch.modifiers.effort_override,
                 .fast = launch.modifiers.fast_override,
+                .provider_order = launch.modifiers.provider_order_override,
+                .provider_strict = launch.modifiers.provider_strict_override,
             },
         );
         errdefer app.deinit();
@@ -1574,9 +1576,10 @@ const App = struct {
         alloc: Allocator,
         permission_rules: types.PermissionRuleSet,
         include_ask_deferred: bool,
-    ) !mcp_model_catalog.Snapshot {
+    ) !mcp_model_catalog.Report {
         return self.mcp.snapshotModelCatalog(
             alloc,
+            self.alloc,
             permission_rules,
             include_ask_deferred,
         );
@@ -1705,6 +1708,10 @@ const App = struct {
 
     pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
         return self.mcp.takeReloadCompletion();
+    }
+
+    pub fn takeMcpStartupHealthNotice(self: *App) !?[]u8 {
+        return self.mcp.takeStartupHealthNotice(self.alloc);
     }
 
     pub fn mcpReloadCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
@@ -2976,6 +2983,7 @@ const App = struct {
         }
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
+        try app_commands.Handlers(App).collectMcpStartupHealthFacts(self);
         if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }

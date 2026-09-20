@@ -154,6 +154,9 @@ pub fn Runtime(comptime App: type) type {
             model: ?[]const u8 = null,
             effort: ?types.ReasoningEffort = null,
             fast: ?bool = null,
+            /// Borrowed from the launch arguments; StartupState dupes on apply.
+            provider_order: ?[]const []const u8 = null,
+            provider_strict: ?bool = null,
         };
 
         pub fn bootstrap(
@@ -433,6 +436,9 @@ pub fn Runtime(comptime App: type) type {
             const persisted_effort = startup.effort;
             const persisted_fast_mode = startup.fast_mode;
             startup.applyLaunchTurnOverrides(launch_overrides.effort, launch_overrides.fast);
+            if (launch_overrides.provider_order != null or launch_overrides.provider_strict != null) {
+                try startup.applyLaunchProviderRouting(app.alloc, launch_overrides.provider_order, launch_overrides.provider_strict);
+            }
             try deps.configure_session_preferences(
                 app,
                 startup.provider,
@@ -454,6 +460,8 @@ pub fn Runtime(comptime App: type) type {
             app.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
             app.worker.agent_turn_settings.fast_mode = startup.fast_mode;
             app.worker.agent_turn_settings.effort = startup.effort;
+            // Worker-owned memory uses the C allocator, matching worker deinit.
+            try app.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
@@ -1084,6 +1092,25 @@ test "app_bootstrap_runtime applies interactive launch flag overrides" {
     try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
     try std.testing.expectEqual(@as(?bool, true), capture.fast_process_override);
     try std.testing.expectEqual(@as(?model_provider.ProviderId, null), capture.provider_process_override);
+}
+
+test "app_bootstrap_runtime applies provider routing launch overrides" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    const order = [_][]const u8{ "azure", "anthropic" };
+    try runBootstrapWithOverridesForTest(&app, &capture, .{
+        .provider_order = &order,
+        .provider_strict = true,
+    });
+
+    const settings = app.worker.agent_turn_settings;
+    try std.testing.expectEqual(@as(usize, 2), settings.provider_order.len);
+    try std.testing.expectEqualStrings("azure", settings.provider_order[0]);
+    try std.testing.expectEqualStrings("anthropic", settings.provider_order[1]);
+    try std.testing.expect(settings.provider_strict);
 }
 
 test "app_bootstrap_runtime launch provider override marks the provider for resume" {

@@ -51,6 +51,8 @@ pub fn main(init: std.process.Init) !void {
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
         .model_override = io_mod.getenv("FX_MODEL"),
+        .effort_override = io_mod.getenv("FX_EFFORT"),
+        .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),
         .workspace_root_override = "/",
         .allow_acp_mcp = false,
         .allow_native_tools = false,
@@ -112,4 +114,13 @@ fn fetchCredits(
     _: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
     return .{};
+}
+
+/// Parses the FX_FAST host toggle: "true"/"1" enable the fast lane,
+/// "false"/"0" disable it, anything else leaves the default in place.
+fn fastOverrideFromEnv(value: ?[]const u8) ?bool {
+    const raw = value orelse return null;
+    if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return null;
 }

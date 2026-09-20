@@ -27,6 +27,8 @@ const scripts = [
   "test-list-models.mjs",
   "test-libfx-loader.mjs",
   "test-agent-bootstrap.mjs",
+  "test-agent-effort.mjs",
+  "test-agent-fast.mjs",
   "test-instruction-limits.mjs",
 ];
 for (const script of scripts) {

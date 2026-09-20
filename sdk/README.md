@@ -41,9 +41,25 @@ await agent.close();
 Agent configuration uses named options; `env` is reserved for
 `createFxTerminal()`.
 
+`effort` sets the reasoning effort for models that advertise effort levels. It
+uses the same vocabulary as the fx CLI's `--effort` flag: `"default"` leaves
+the choice to the model, and named levels such as `"low"`, `"medium"`,
+`"high"`, or `"xhigh"` request a specific level. A named level is validated
+against the selected model's advertised levels at creation; an unsupported
+level rejects with an error (code `LIBFX_UNSUPPORTED_EFFORT`) naming the
+supported set. When `effort` is omitted or `"default"`, the model default
+applies.
+
+`fast` enables the fast lane for models that advertise one, matching the fx
+CLI's `--fast` flag. Enabling it is validated against the selected model at
+creation; a model without a fast path rejects with an error (code
+`LIBFX_UNSUPPORTED_FAST`). When `fast` is omitted or `false`, the model
+default applies.
+
 The host selects the model. Agent creation does not fetch the Gateway model
-catalog. Prompting can resolve model capabilities and context capacity through
-the supplied `fetch`; fx caches that metadata for the agent.
+catalog unless `effort` requests a named level or `fast` is enabled. Prompting
+can resolve model capabilities and context capacity through the supplied
+`fetch`; fx caches that metadata for the agent.
 
 `onEvent` receives runtime diagnostics separately from model output. Transport
 events report request start, response status and elapsed time, safe Gateway
@@ -95,7 +111,10 @@ or a history change. The next prompt can run normally.
 
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
-MCP clients, and skill records.
+MCP clients, and skill records. Reasoning effort and fast mode are
+agent-creation options and are not stored in a checkpoint: recreate the agent
+with new `effort` or `fast` values to change them, the same path as switching
+models.
 
 ## Models
 

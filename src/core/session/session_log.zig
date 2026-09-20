@@ -271,7 +271,7 @@ pub const ConversationWriter = struct {
             .tool_call => |call| blk: {
                 try self.pending_tool_calls.ensureUnusedCapacity(self.alloc, 1);
                 const call_id = try self.alloc.dupe(u8, call.call_id);
-                errdefer self.alloc.free(call_id);
+                errdefer mem_utils.free(self.alloc, call_id);
                 const tool_name = try self.alloc.dupe(u8, call.tool_name);
                 owned_pending = .{
                     .call_id = call_id,
@@ -450,7 +450,7 @@ pub const ConversationWriter = struct {
         const size = std.math.cast(usize, self.committed_bytes) orelse
             return error.ConversationTooLarge;
         const bytes = try alloc.alloc(u8, size);
-        errdefer alloc.free(bytes);
+        errdefer mem_utils.free(alloc, bytes);
         const count = try self.file.readPositionalAll(io_mod.getIo(), bytes, 0);
         if (count != size) return error.TruncatedConversation;
         return bytes;
@@ -579,9 +579,9 @@ pub const ConversationWriter = struct {
         switch (event) {
             .tool_call => |call| {
                 const call_id = try self.alloc.dupe(u8, call.call_id);
-                errdefer self.alloc.free(call_id);
+                errdefer mem_utils.free(self.alloc, call_id);
                 const tool_name = try self.alloc.dupe(u8, call.tool_name);
-                errdefer self.alloc.free(tool_name);
+                errdefer mem_utils.free(self.alloc, tool_name);
                 try self.pending_tool_calls.append(self.alloc, .{
                     .call_id = call_id,
                     .tool_name = tool_name,
@@ -1022,7 +1022,7 @@ fn load_conversation_state_at_boundary(
         try alloc.dupe(u8, work_id)
     else
         null;
-    errdefer if (last_work_id) |work_id| alloc.free(work_id);
+    errdefer if (last_work_id) |work_id| mem_utils.free(alloc, work_id);
     var usage: ?session_usage.Snapshot = try session_usage_sidecar.loadConversation(
         alloc,
         dir,
@@ -1047,13 +1047,13 @@ fn load_conversation_state_at_boundary(
         }
     }
     const id = try alloc.dupe(u8, metadata.value.id);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const origin = try alloc.dupe(u8, metadata.value.origin_workspace_root);
-    errdefer alloc.free(origin);
+    errdefer mem_utils.free(alloc, origin);
     const workspace = try alloc.dupe(u8, metadata.value.workspace_root);
-    errdefer alloc.free(workspace);
+    errdefer mem_utils.free(alloc, workspace);
     const model = try alloc.dupe(u8, metadata.value.model);
-    errdefer alloc.free(model);
+    errdefer mem_utils.free(alloc, model);
     const language = session.ConversationLanguage.fromSlice(
         metadata.value.conversation_language,
     ) catch return error.InvalidSessionMetadata;
@@ -1535,7 +1535,7 @@ fn openConversationWritableSession(
         }
     }
     const active_id = try alloc.dupe(u8, writable.session_id);
-    errdefer alloc.free(active_id);
+    errdefer mem_utils.free(alloc, active_id);
     const generation = randomIdentifier();
     const position = CommitPosition{
         .log_generation = generation,
@@ -1749,7 +1749,7 @@ fn replayConversationHistory(
     if (window.checkpoint_offset) |checkpoint_offset| {
         const frame = (try source.readAtLogOffset(frame_arena.allocator(), checkpoint_offset)) orelse return error.InvalidConversationFrame;
         const summary = try alloc.dupe(u8, frame.envelope.event.context_checkpoint.summary);
-        errdefer alloc.free(summary);
+        errdefer mem_utils.free(alloc, summary);
         try history.append(alloc, .{ .compacted_summary = .{
             .summary = summary,
             .removed_turn_count = window.prior_turn_count,
@@ -2192,7 +2192,7 @@ const ConversationTurnBuilder = struct {
         }
         {
             const text = try self.alloc.dupe(u8, value.text);
-            errdefer self.alloc.free(text);
+            errdefer mem_utils.free(self.alloc, text);
             self.pending_replay = if (value.provider_replay) |replay| try types.dupeProviderReplay(self.alloc, replay) else null;
             self.pending_assistant = text;
         }
@@ -2285,7 +2285,7 @@ const ConversationTurnBuilder = struct {
         }
         if (self.pending_replay != null) try self.finishStep();
         const owned = try self.alloc.dupe(u8, text);
-        errdefer self.alloc.free(owned);
+        errdefer mem_utils.free(self.alloc, owned);
         try self.steering.append(self.alloc, .{
             .text = owned,
             .assistant_prefix = self.pending_assistant,
@@ -2348,7 +2348,7 @@ const ConversationTurnBuilder = struct {
             try self.alloc.dupe(u8, text)
         else
             null;
-        errdefer if (assistant) |text| self.alloc.free(text);
+        errdefer if (assistant) |text| mem_utils.free(self.alloc, text);
         const replay = if (value.command_replay_ref) |handle| blk: {
             const owned_handle = try self.alloc.dupe(u8, handle);
             break :blk types.CommandOutputReplay{ .available = .{
@@ -2367,7 +2367,7 @@ const ConversationTurnBuilder = struct {
             try self.alloc.dupe(u8, handle)
         else
             null;
-        errdefer if (command_artifact) |handle| self.alloc.free(handle);
+        errdefer if (command_artifact) |handle| mem_utils.free(self.alloc, handle);
         const cancelled_command = if (replay != null or command_artifact != null)
             types.CancelledCommandPresentation{
                 .output_replay = replay,
@@ -2496,22 +2496,22 @@ fn dupeConversationToolResult(
     value: session_event.ConversationToolResult,
 ) !types.PersistedToolResult {
     const call_id = try alloc.dupe(u8, value.call_id);
-    errdefer alloc.free(call_id);
+    errdefer mem_utils.free(alloc, call_id);
     const tool_name = try alloc.dupe(u8, value.tool_name);
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     const output = try alloc.dupe(u8, value.preview orelse "");
-    errdefer alloc.free(output);
+    errdefer mem_utils.free(alloc, output);
     const handle = try alloc.dupe(u8, value.artifact_ref);
-    errdefer alloc.free(handle);
+    errdefer mem_utils.free(alloc, handle);
     const image_handle = if (value.tool_image_handle) |image_ref| try alloc.dupe(u8, image_ref) else null;
-    errdefer if (image_handle) |image_ref| alloc.free(image_ref);
+    errdefer if (image_handle) |image_ref| mem_utils.free(alloc, image_ref);
     const preview = if (value.preview) |text| try alloc.dupe(u8, text) else null;
-    errdefer if (preview) |text| alloc.free(text);
+    errdefer if (preview) |text| mem_utils.free(alloc, text);
     var permission_feedback: [][]u8 = if (value.permission_feedback.len > 0)
         try alloc.alloc([]u8, value.permission_feedback.len)
     else
         &.{};
-    errdefer if (permission_feedback.len > 0) alloc.free(permission_feedback);
+    errdefer if (permission_feedback.len > 0) mem_utils.free(alloc, permission_feedback);
     var feedback_count: usize = 0;
     errdefer for (permission_feedback[0..feedback_count]) |feedback| {
         alloc.free(feedback);
@@ -3148,7 +3148,7 @@ pub const LoadedWritableSession = struct {
             try alloc.dupe(u8, value)
         else
             null;
-        errdefer if (work_id) |value| alloc.free(value);
+        errdefer if (work_id) |value| mem_utils.free(alloc, value);
         try self.conversation_writer.appendHistoryTurn(
             alloc,
             timestamp_ms,
@@ -3194,6 +3194,9 @@ pub const LoadedWritableSession = struct {
         var display = session_display_metadata.deriveFromHistory(alloc, &.{turn}) catch return;
         defer display.deinit(alloc);
         if (!display.present) return;
+        // The fallback placeholder is not a title: persisting it would block
+        // background title generation, which never overwrites a named session.
+        if (std.mem.eql(u8, display.title, session_display_metadata.fallback_title)) return;
         _ = self.renameConversation(alloc, display.title) catch |err| {
             debug_trace.logf(
                 "session",
@@ -3265,7 +3268,7 @@ pub const LoadedWritableSession = struct {
                     return error.ImmutableSessionIdentity;
                 }
                 const workspace_root = try alloc.dupe(u8, rebound.workspace_root);
-                errdefer alloc.free(workspace_root);
+                errdefer mem_utils.free(alloc, workspace_root);
                 var proposed = self.state;
                 proposed.workspace_root = workspace_root;
                 proposed.updated_at_ms = timestamp_ms;
@@ -3459,7 +3462,7 @@ fn importLegacySnapshotStateWithOps(
     try externalizeConversationResults(alloc, &converted, &capability);
 
     const active_id = try alloc.dupe(u8, writable.session_id);
-    errdefer alloc.free(active_id);
+    errdefer mem_utils.free(alloc, active_id);
     try deleteConversationMigrationFile(
         &writable.dir,
         conversation_migration_temp_file,
@@ -4215,7 +4218,7 @@ fn createNativeSession(
     }
     try writeConversationControlState(alloc, &writable.dir, state, conversation_writer.last_seq);
     const active_id = try alloc.dupe(u8, writable.session_id);
-    errdefer alloc.free(active_id);
+    errdefer mem_utils.free(alloc, active_id);
     const generation = randomIdentifier();
     const position = CommitPosition{
         .log_generation = generation,
@@ -4540,6 +4543,48 @@ test "committed conversation language survives reopening" {
     defer restored.deinit(alloc);
     try std.testing.expectEqualStrings("fr", restored.conversation_language.view());
     try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "first commit never persists the fallback placeholder as a title" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+
+    // An unusable first prompt (a bare path reads as slash-command-only) must
+    // not persist the fallback title, or later title generation could never
+    // name the session.
+    var initial = try testState(alloc, "fallback-title-skipped", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .interrupted = .{ .user = .{ .text = @constCast("/tmp/fx-trace.md") } } },
+        } }, 20);
+        const title = try loaded.conversationTitle(alloc);
+        defer if (title) |value| alloc.free(value);
+        try std.testing.expect(title == null);
+    }
+
+    // A usable first prompt still derives and persists a title.
+    var second = try testState(alloc, "derived-title-kept", 10);
+    defer second.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, second, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{ .user = .{ .text = @constCast("refactor the renderer") }, .assistant = @constCast("done") } },
+        } }, 20);
+        const title = try loaded.conversationTitle(alloc);
+        defer if (title) |value| alloc.free(value);
+        try std.testing.expectEqualStrings("refactor the renderer", title.?);
+    }
 }
 
 test "conversation load retains history and qualifies missing or corrupt accounting" {

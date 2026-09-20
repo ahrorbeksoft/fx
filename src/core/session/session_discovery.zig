@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -132,7 +133,7 @@ pub fn appendDoctorDiagnostic(
     bytes: ?u64,
 ) !void {
     const owned_id = try alloc.dupe(u8, session_id);
-    errdefer alloc.free(owned_id);
+    errdefer mem_utils.free(alloc, owned_id);
     try diagnostics.append(alloc, .{
         .session_id = owned_id,
         .kind = kind,
@@ -356,11 +357,11 @@ fn classifyConversationCandidate(
     }
 
     const id = try alloc.dupe(u8, metadata.id);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const origin = try alloc.dupe(u8, metadata.origin_workspace_root);
-    errdefer alloc.free(origin);
+    errdefer mem_utils.free(alloc, origin);
     const workspace = try alloc.dupe(u8, metadata.workspace_root);
-    errdefer alloc.free(workspace);
+    errdefer mem_utils.free(alloc, workspace);
     const title = if (metadata.title) |value| try alloc.dupe(u8, value) else null;
     return .{
         .summary = .{
@@ -521,11 +522,11 @@ pub fn classifySchemaV3Candidate(
     const history_len = std.math.cast(usize, manifest.history_len) orelse
         return error.InvalidSessionFormat;
     const id = try alloc.dupe(u8, manifest.id);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const origin_workspace_root = try alloc.dupe(u8, manifest.origin_workspace_root);
-    errdefer alloc.free(origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin_workspace_root);
     const workspace_root = try alloc.dupe(u8, manifest.workspace_root);
-    errdefer alloc.free(workspace_root);
+    errdefer mem_utils.free(alloc, workspace_root);
     var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
     if (display.origin_workspace_root) |root| {
         alloc.free(root);
@@ -667,11 +668,11 @@ pub fn summaryFromState(
     state: session_codec.DurableSessionState,
 ) !SessionSummary {
     const id = try alloc.dupe(u8, state.id);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const origin_workspace_root = try alloc.dupe(u8, state.origin_workspace_root);
-    errdefer alloc.free(origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin_workspace_root);
     const workspace_root = try alloc.dupe(u8, state.workspace_root);
-    errdefer alloc.free(workspace_root);
+    errdefer mem_utils.free(alloc, workspace_root);
     var display = try session_display_metadata.deriveFromHistory(alloc, state.history);
     errdefer display.deinit(alloc);
 
@@ -700,7 +701,7 @@ pub fn dupeWritableCandidate(
     projection_state: ProjectionState,
 ) !WritableCandidate {
     const id = try alloc.dupe(u8, id_source);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const workspace_root = try alloc.dupe(u8, workspace_source);
     return .{
         .id = id,

@@ -87,10 +87,6 @@ pub fn traceLogPath(alloc: Allocator, home: []const u8) ![]u8 {
 pub const diagnostics_dir_name = "diagnostics";
 pub const last_shutdown_report_file_name = "last-shutdown.json";
 
-pub fn diagnosticsDir(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, root_dir_name, diagnostics_dir_name });
-}
-
 pub fn lastShutdownReportPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, diagnostics_dir_name, last_shutdown_report_file_name });
 }

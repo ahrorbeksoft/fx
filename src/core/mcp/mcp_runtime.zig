@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const collections = @import("../shared/collections.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const mcp_auth = @import("mcp_auth.zig");
@@ -767,7 +768,7 @@ pub const McpRuntime = struct {
                         .disabled => .disabled,
                         .ready => .ready,
                         .failed => .failed,
-                    }, serverAuthenticationState(server), server.last_error);
+                    }, serverAuthenticationState(server), server.config.name, server.last_error);
                     defer if (failure) |message| self.alloc.free(message);
                     return try std.fmt.allocPrint(self.alloc, "Required MCP server '{s}' failed to start: {s}", .{ safe_name, failure orelse "Check the trusted profile configuration and retry." });
                 }
@@ -891,7 +892,7 @@ pub const McpRuntime = struct {
                 server.config.source != .workspace or
                 server.config.workspace_admission != .pending) continue;
             const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
-            errdefer alloc.free(owned_name);
+            errdefer mem_utils.free(alloc, owned_name);
             try names.append(alloc, owned_name);
         }
         return names.toOwnedSlice(alloc);
@@ -1160,6 +1161,7 @@ pub const McpRuntime = struct {
         name: []u8,
         command: []u8,
         state: health.ConnectionState,
+        status: health.Status,
         tool_count: usize,
         last_error: ?[]u8,
 
@@ -1192,15 +1194,16 @@ pub const McpRuntime = struct {
         }
         for (snapshot.servers, 0..) |observed, index| {
             const name = try alloc.dupe(u8, observed.identity());
-            errdefer alloc.free(name);
+            errdefer mem_utils.free(alloc, name);
             const server = self.acquireServer(observed.identity());
             defer if (server) |value| value.lifetime.release(io_mod.getIo());
             const command = try alloc.dupe(u8, if (server) |value| value.config.command orelse "" else "");
-            errdefer alloc.free(command);
+            errdefer mem_utils.free(alloc, command);
             items[index] = .{
                 .name = name,
                 .command = command,
                 .state = observed.connection,
+                .status = health.classify(observed.connection, observed.authentication, false),
                 .tool_count = observed.counts.tools orelse 0,
                 .last_error = if (observed.failure) |failure| try alloc.dupe(u8, failure) else null,
             };
@@ -1773,9 +1776,9 @@ pub const McpRuntime = struct {
         features_visible: bool,
     ) !access_policy.View {
         const owned_owner = try alloc.dupe(u8, owner_id);
-        errdefer alloc.free(owned_owner);
+        errdefer mem_utils.free(alloc, owned_owner);
         const owned_parent = try alloc.dupe(u8, parent_id);
-        errdefer alloc.free(owned_parent);
+        errdefer mem_utils.free(alloc, owned_parent);
         var servers: std.ArrayList(access_policy.ServerIdentity) = .empty;
         errdefer {
             for (servers.items) |*server| server.deinit(alloc);
@@ -2351,7 +2354,39 @@ pub const McpRuntime = struct {
         try operation_access.authorize(.{ .feature_server = request.server_name });
         var images: []types.ToolImage = &.{};
         errdefer types.freeToolImages(alloc, images);
-        const model_output = switch (request.action) {
+        const model_output = self.renderFeatureModelOutput(
+            alloc,
+            request,
+            options,
+            &images,
+        ) catch |err| switch (err) {
+            // A server that never advertised resources or prompts has not
+            // failed; the feature is simply absent. Tell the model instead of
+            // surfacing a tool execution failure.
+            error.McpResourcesUnsupported, error.McpPromptsUnsupported => try renderUnsupportedForModel(
+                alloc,
+                request.action,
+                request.server_name,
+            ),
+            else => return err,
+        };
+        errdefer mem_utils.free(alloc, model_output);
+        if (model_output.len > options.output_limit_bytes) {
+            return error.McpFeatureOutputLimitExceeded;
+        }
+        try operation_access.refresh();
+        try operation_access.authorize(.{ .feature_server = request.server_name });
+        return .{ .model_output = model_output, .images = images };
+    }
+
+    fn renderFeatureModelOutput(
+        self: *McpRuntime,
+        alloc: Allocator,
+        request: tool_mcp_runtime.FeatureRequest,
+        options: tool_mcp_runtime.FeatureCallOptions,
+        images: *[]types.ToolImage,
+    ) ![]u8 {
+        return switch (request.action) {
             .resource_list, .resource_templates => output: {
                 var result = try self.listResources(
                     alloc,
@@ -2391,7 +2426,7 @@ pub const McpRuntime = struct {
                     return err;
                 };
                 defer result.deinit(alloc);
-                images = try feature_result.resourceImages(alloc, result);
+                images.* = try feature_result.resourceImages(alloc, result);
                 break :output try renderResourceReadForModel(alloc, result);
             },
             .prompt_list => output: {
@@ -2432,7 +2467,7 @@ pub const McpRuntime = struct {
                     return err;
                 };
                 defer result.deinit(alloc);
-                images = try feature_result.promptImages(alloc, result);
+                images.* = try feature_result.promptImages(alloc, result);
                 break :output try renderPromptGetForModel(alloc, result);
             },
             .prompt_complete, .resource_complete => output: {
@@ -2477,17 +2512,11 @@ pub const McpRuntime = struct {
                 );
             },
         };
-        errdefer alloc.free(model_output);
-        if (model_output.len > options.output_limit_bytes) {
-            return error.McpFeatureOutputLimitExceeded;
-        }
-        try operation_access.refresh();
-        try operation_access.authorize(.{ .feature_server = request.server_name });
-        return .{ .model_output = model_output, .images = images };
     }
 };
 
 const renderResourceCatalogForModel = feature_result.renderResourceCatalogForModel;
+const renderUnsupportedForModel = feature_result.renderUnsupportedForModel;
 const renderResourceReadForModel = feature_result.renderResourceReadForModel;
 const renderPromptCatalogForModel = feature_result.renderPromptCatalogForModel;
 const renderPromptGetForModel = feature_result.renderPromptGetForModel;
@@ -7339,11 +7368,24 @@ test "MCP authentication guidance requires an observed challenge" {
     const output = (try renderAuthenticationRequired(alloc, &.{&servers[0]}, &access, "plain")).?;
     defer alloc.free(output);
     try std.testing.expect(std.mem.find(u8, output, "/mcp auth plain --open") != null);
+
+    servers[0].state = .init(.disconnected);
+    const disconnected_output = (try renderAuthenticationRequired(alloc, &.{&servers[0]}, &access, "plain")).?;
+    defer alloc.free(disconnected_output);
+    try std.testing.expect(std.mem.find(u8, disconnected_output, "/mcp auth plain --open") != null);
+}
+
+test "MCP authentication failure text names the server" {
+    const alloc = std.testing.allocator;
+    const output = (try healthFailureForState(alloc, false, .failed, .required, "linear", null)).?;
+    defer alloc.free(output);
+    try std.testing.expect(std.mem.find(u8, output, "/mcp auth linear --open") != null);
+    try std.testing.expect(std.mem.find(u8, output, "<name>") == null);
 }
 
 test "MCP connection diagnostics retain the cause and mask sensitive values" {
     const alloc = std.testing.allocator;
-    const output = (try healthFailureForState(alloc, false, .failed, .configured, "HTTP 500 TOKEN=example-secret")).?;
+    const output = (try healthFailureForState(alloc, false, .failed, .configured, "docs", "HTTP 500 TOKEN=example-secret")).?;
     defer alloc.free(output);
     try std.testing.expect(std.mem.find(u8, output, "HTTP 500") != null);
     try std.testing.expect(std.mem.find(u8, output, "example-secret") == null);
@@ -8500,4 +8542,34 @@ test "connection retirement waits for the admitted transport commit" {
         null,
     ));
     try std.testing.expect(!tool_snapshot.current(server, &snapshot));
+}
+
+test "feature calls on a server without the capability render as unsupported, not failure" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "linear"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    const server = runtime.servers.items[0];
+    server.state.store(.ready, .release);
+
+    var result = try runtime.callFeatureForModel(
+        alloc,
+        .{ .action = .resource_list, .server_name = "linear" },
+        .{ .output_limit_bytes = 64 * 1024 },
+    );
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "\"unsupported\":true") != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "did not advertise a resources capability") != null);
+
+    var prompts_result = try runtime.callFeatureForModel(
+        alloc,
+        .{ .action = .prompt_list, .server_name = "linear" },
+        .{ .output_limit_bytes = 64 * 1024 },
+    );
+    defer prompts_result.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, prompts_result.model_output, "did not advertise a prompts capability") != null);
 }

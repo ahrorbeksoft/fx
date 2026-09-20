@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const secret = @import("../auth/secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const generation_usage = @import("generation_usage_provider.zig");
 const io_mod = @import("../shared/io.zig");
@@ -284,11 +285,11 @@ pub const PendingGeneration = struct {
 
     fn dupe(self: PendingGeneration, alloc: Allocator) Allocator.Error!PendingGeneration {
         const id = try alloc.dupe(u8, self.id);
-        errdefer alloc.free(id);
+        errdefer mem_utils.free(alloc, id);
         const origin = try alloc.dupe(u8, self.origin);
-        errdefer alloc.free(origin);
+        errdefer mem_utils.free(alloc, origin);
         const team = if (self.team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (team) |value| alloc.free(value);
+        errdefer if (team) |value| mem_utils.free(alloc, value);
         const account_id = if (self.account_id) |value| try alloc.dupe(u8, value) else null;
         return .{
             .id = id,
@@ -1028,13 +1029,13 @@ pub const Usage = struct {
             return error.UsageCapacityExceeded;
         }
         const owned_id = try alloc.dupe(u8, id);
-        errdefer alloc.free(owned_id);
+        errdefer mem_utils.free(alloc, owned_id);
         const owned_origin = try alloc.dupe(u8, origin);
-        errdefer alloc.free(owned_origin);
+        errdefer mem_utils.free(alloc, owned_origin);
         const owned_team = if (team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_team) |value| alloc.free(value);
+        errdefer if (owned_team) |value| mem_utils.free(alloc, value);
         const owned_account_id = if (account_id) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_account_id) |value| alloc.free(value);
+        errdefer if (owned_account_id) |value| mem_utils.free(alloc, value);
         try self.pending.append(alloc, .{
             .id = owned_id,
             .sequence = sequence,
@@ -1164,7 +1165,7 @@ pub const Usage = struct {
         ) catch return self.failOverflow();
 
         var owned_model: ?[]u8 = null;
-        errdefer if (owned_model) |model| alloc.free(model);
+        errdefer if (owned_model) |model| mem_utils.free(alloc, model);
         if (model_index == null) {
             owned_model = try alloc.dupe(u8, record.model);
             try self.models.ensureUnusedCapacity(alloc, 1);
@@ -1288,7 +1289,7 @@ pub const Usage = struct {
             usage_report.PendingMarker,
             self.pending.items.len,
         );
-        errdefer alloc.free(pending);
+        errdefer mem_utils.free(alloc, pending);
         var copied_pending: usize = 0;
         errdefer for (pending[0..copied_pending]) |*marker| marker.deinit(alloc);
         for (self.pending.items, 0..) |generation, index| {
@@ -1303,13 +1304,13 @@ pub const Usage = struct {
             usage_report.Incident,
             self.incidents[0..self.incident_count],
         );
-        errdefer alloc.free(incidents);
+        errdefer mem_utils.free(alloc, incidents);
 
         const facts = try alloc.alloc(
             usage_report.GenerationFact,
             self.publication_backlog.items.len,
         );
-        errdefer alloc.free(facts);
+        errdefer mem_utils.free(alloc, facts);
         var copied_facts: usize = 0;
         errdefer for (facts[0..copied_facts]) |*fact| fact.deinit(alloc);
         for (self.publication_backlog.items, 0..) |fact, index| {
@@ -1604,7 +1605,7 @@ pub const Usage = struct {
         defer self.mutex.unlock(io_mod.getIo());
 
         const models = try alloc.alloc(ModelAggregate, self.models.items.len);
-        errdefer alloc.free(models);
+        errdefer mem_utils.free(alloc, models);
         var copied_models: usize = 0;
         errdefer for (models[0..copied_models]) |*model| model.deinit(alloc);
         for (self.models.items, 0..) |model, index| {
@@ -1613,7 +1614,7 @@ pub const Usage = struct {
         }
 
         const pending = try alloc.alloc(PendingGeneration, self.pending.items.len);
-        errdefer alloc.free(pending);
+        errdefer mem_utils.free(alloc, pending);
         var copied_pending: usize = 0;
         errdefer for (pending[0..copied_pending]) |*generation| generation.deinit(alloc);
         for (self.pending.items, 0..) |generation, index| {
@@ -1625,7 +1626,7 @@ pub const Usage = struct {
             usage_report.GenerationFact,
             self.publication_backlog.items.len,
         );
-        errdefer alloc.free(publication_backlog);
+        errdefer mem_utils.free(alloc, publication_backlog);
         var copied_publications: usize = 0;
         errdefer for (publication_backlog[0..copied_publications]) |*fact| {
             fact.deinit(alloc);
@@ -1639,7 +1640,7 @@ pub const Usage = struct {
             usage_report.Incident,
             self.incidents[0..self.incident_count],
         );
-        errdefer alloc.free(incidents);
+        errdefer mem_utils.free(alloc, incidents);
 
         const now_ms = io_mod.milliTimestamp();
         if (self.active_started_at_ms == 0) self.active_started_at_ms = now_ms;
@@ -2921,11 +2922,65 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
         return error.UsageCapacityExceeded;
     }
 
-    const models = try alloc.alloc(ModelAggregate, models_value.array.items.len);
-    errdefer alloc.free(models);
-    var model_count: usize = 0;
-    errdefer for (models[0..model_count]) |*model| model.deinit(alloc);
-    for (models_value.array.items, 0..) |model_value, index| {
+    const models = try parseModelAggregates(
+        alloc,
+        models_value.array.items,
+        legacy,
+    );
+    errdefer deinitModelAggregates(alloc, models);
+    const pending = try parsePendingGenerations(
+        alloc,
+        pending_value.array.items,
+    );
+    errdefer deinitPendingGenerations(alloc, pending);
+    const publication_backlog = try parsePublicationBacklog(
+        alloc,
+        value.object,
+        legacy,
+    );
+    errdefer deinitPublicationBacklog(alloc, publication_backlog);
+    const incidents = try parseUsageIncidents(alloc, value.object, legacy);
+    errdefer if (incidents.len > 0) mem_utils.free(alloc, incidents);
+
+    const snapshot = Snapshot{
+        .billing = billing,
+        .api_duration_complete = api_complete,
+        .wall_duration_complete = wall_complete,
+        .code_complete = code_complete,
+        .next_sequence = next_sequence,
+        .settled_through_sequence = settled_through_sequence,
+        .api_duration_ms = api_duration_ms,
+        .wall_duration_ms = wall_duration_ms,
+        .total_cost = total_cost,
+        .input_tokens = input_tokens,
+        .output_tokens = output_tokens,
+        .cache_read_tokens = cache_read_tokens,
+        .cache_write_tokens = cache_write_tokens,
+        .reasoning_tokens = reasoning_tokens,
+        .request_count = request_count,
+        .billable_web_search_calls = billable_web_search_calls,
+        .lines_added = lines_added,
+        .lines_removed = lines_removed,
+        .models = models,
+        .pending = pending,
+        .publication_backlog = publication_backlog,
+        .incidents = incidents,
+    };
+    return snapshot;
+}
+
+fn parseModelAggregates(
+    alloc: Allocator,
+    values: []const std.json.Value,
+    legacy: bool,
+) ![]ModelAggregate {
+    const models = try alloc.alloc(ModelAggregate, values.len);
+    var count: usize = 0;
+    errdefer {
+        for (models[0..count]) |*model| model.deinit(alloc);
+        mem_utils.free(alloc, models);
+    }
+    for (values, 0..) |model_value, index| {
         const expected_model_fields: usize = if (legacy) 8 else 10;
         if (model_value != .object or
             model_value.object.count() != expected_model_fields)
@@ -2969,14 +3024,27 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
             .request_count = model_request_count,
             .billable_web_search_calls = model_web_search_calls,
         };
-        model_count += 1;
+        count += 1;
     }
+    return models;
+}
 
-    const pending = try alloc.alloc(PendingGeneration, pending_value.array.items.len);
-    errdefer alloc.free(pending);
-    var pending_count: usize = 0;
-    errdefer for (pending[0..pending_count]) |*generation| generation.deinit(alloc);
-    for (pending_value.array.items, 0..) |pending_entry, index| {
+fn deinitModelAggregates(alloc: Allocator, models: []ModelAggregate) void {
+    for (models) |*model| model.deinit(alloc);
+    mem_utils.free(alloc, models);
+}
+
+fn parsePendingGenerations(
+    alloc: Allocator,
+    values: []const std.json.Value,
+) ![]PendingGeneration {
+    const pending = try alloc.alloc(PendingGeneration, values.len);
+    var count: usize = 0;
+    errdefer {
+        for (pending[0..count]) |*generation| generation.deinit(alloc);
+        mem_utils.free(alloc, pending);
+    }
+    for (values, 0..) |pending_entry, index| {
         if (pending_entry != .object) return error.InvalidUsageSnapshot;
         const provider_scoped = pending_entry.object.contains("provider");
         const has_observed_at = pending_entry.object.contains("observed_at_ms");
@@ -2986,9 +3054,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
             5
         else
             4;
-        if (pending_entry != .object or
-            pending_entry.object.count() != expected_pending_fields)
-        {
+        if (pending_entry.object.count() != expected_pending_fields) {
             return error.InvalidUsageSnapshot;
         }
         const id_value = pending_entry.object.get("id") orelse return error.InvalidUsageSnapshot;
@@ -3003,15 +3069,15 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
         };
         if (team_value != .null and team_value != .string) return error.InvalidUsageSnapshot;
         const id = try alloc.dupe(u8, id_value.string);
-        errdefer alloc.free(id);
+        errdefer mem_utils.free(alloc, id);
         const origin = try alloc.dupe(u8, origin_value.string);
-        errdefer alloc.free(origin);
+        errdefer mem_utils.free(alloc, origin);
         const team = switch (team_value) {
             .null => null,
             .string => |text| try alloc.dupe(u8, text),
             else => unreachable,
         };
-        errdefer if (team) |text| alloc.free(text);
+        errdefer if (team) |text| mem_utils.free(alloc, text);
         const provider = if (provider_scoped) provider: {
             const field = pending_entry.object.get("provider") orelse return error.InvalidUsageSnapshot;
             if (field != .string) return error.InvalidUsageSnapshot;
@@ -3029,7 +3095,7 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
             try parseOptionalOwnedString(alloc, pending_entry.object.get("account_id"))
         else
             null;
-        errdefer if (account_id) |text| alloc.free(text);
+        errdefer if (account_id) |text| mem_utils.free(alloc, text);
         pending[index] = .{
             .id = id,
             .sequence = sequence,
@@ -3041,105 +3107,86 @@ fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
             .account_id = account_id,
             .observed_at_ms = observed_at_ms,
         };
-        pending_count += 1;
+        count += 1;
     }
+    return pending;
+}
 
-    const publication_backlog = if (legacy) blk: {
-        break :blk try alloc.alloc(usage_report.GenerationFact, 0);
-    } else blk: {
-        const backlog_value = value.object.get("publication_backlog") orelse
-            return error.InvalidUsageSnapshot;
-        if (backlog_value != .array or
-            backlog_value.array.items.len > max_publication_backlog)
-        {
-            return error.InvalidUsageSnapshot;
-        }
-        const backlog = try alloc.alloc(
-            usage_report.GenerationFact,
-            backlog_value.array.items.len,
-        );
-        errdefer alloc.free(backlog);
-        var backlog_count: usize = 0;
-        errdefer for (backlog[0..backlog_count]) |*fact| fact.deinit(alloc);
-        for (backlog_value.array.items, 0..) |fact_value, index| {
-            backlog[index] = generation_fact_codec.parse(
-                alloc,
-                fact_value,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidGenerationFact => return error.InvalidUsageSnapshot,
-            };
-            backlog_count += 1;
-        }
-        break :blk backlog;
-    };
+fn deinitPendingGenerations(
+    alloc: Allocator,
+    pending: []PendingGeneration,
+) void {
+    for (pending) |*generation| generation.deinit(alloc);
+    mem_utils.free(alloc, pending);
+}
+
+fn parsePublicationBacklog(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    legacy: bool,
+) ![]usage_report.GenerationFact {
+    if (legacy) return alloc.alloc(usage_report.GenerationFact, 0);
+    const value = object.get("publication_backlog") orelse
+        return error.InvalidUsageSnapshot;
+    if (value != .array or value.array.items.len > max_publication_backlog) {
+        return error.InvalidUsageSnapshot;
+    }
+    const backlog = try alloc.alloc(usage_report.GenerationFact, value.array.items.len);
+    var count: usize = 0;
     errdefer {
-        for (publication_backlog) |*fact| fact.deinit(alloc);
-        if (publication_backlog.len > 0) alloc.free(publication_backlog);
+        for (backlog[0..count]) |*fact| fact.deinit(alloc);
+        mem_utils.free(alloc, backlog);
     }
+    for (value.array.items, 0..) |fact, index| {
+        backlog[index] = generation_fact_codec.parse(alloc, fact) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidGenerationFact => return error.InvalidUsageSnapshot,
+        };
+        count += 1;
+    }
+    return backlog;
+}
 
-    const incidents = if (legacy) blk: {
-        break :blk try alloc.alloc(usage_report.Incident, 0);
-    } else blk: {
-        const incidents_value = value.object.get("incidents") orelse
-            return error.InvalidUsageSnapshot;
-        if (incidents_value != .array or
-            incidents_value.array.items.len > max_usage_incidents)
-        {
+fn deinitPublicationBacklog(
+    alloc: Allocator,
+    backlog: []usage_report.GenerationFact,
+) void {
+    for (backlog) |*fact| fact.deinit(alloc);
+    mem_utils.free(alloc, backlog);
+}
+
+fn parseUsageIncidents(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    legacy: bool,
+) ![]usage_report.Incident {
+    if (legacy) return alloc.alloc(usage_report.Incident, 0);
+    const value = object.get("incidents") orelse
+        return error.InvalidUsageSnapshot;
+    if (value != .array or value.array.items.len > max_usage_incidents) {
+        return error.InvalidUsageSnapshot;
+    }
+    const incidents = try alloc.alloc(usage_report.Incident, value.array.items.len);
+    errdefer mem_utils.free(alloc, incidents);
+    for (value.array.items, 0..) |incident, index| {
+        if (incident != .object or incident.object.count() != 2) {
             return error.InvalidUsageSnapshot;
         }
-        const owned_incidents = try alloc.alloc(
-            usage_report.Incident,
-            incidents_value.array.items.len,
-        );
-        errdefer alloc.free(owned_incidents);
-        for (incidents_value.array.items, 0..) |incident_value, index| {
-            if (incident_value != .object or incident_value.object.count() != 2) {
-                return error.InvalidUsageSnapshot;
-            }
-            const completeness_value = incident_value.object.get("completeness") orelse
-                return error.InvalidUsageSnapshot;
-            if (completeness_value != .string) return error.InvalidUsageSnapshot;
-            const completeness = std.meta.stringToEnum(
-                usage_report.Completeness,
-                completeness_value.string,
-            ) orelse return error.InvalidUsageSnapshot;
-            owned_incidents[index] = .{
-                .occurred_at_ms = try parseNonNegativeI64(
-                    incident_value.object.get("occurred_at_ms"),
-                ),
-                .completeness = completeness,
-            };
-        }
-        break :blk owned_incidents;
-    };
-    errdefer if (incidents.len > 0) alloc.free(incidents);
-
-    const snapshot = Snapshot{
-        .billing = billing,
-        .api_duration_complete = api_complete,
-        .wall_duration_complete = wall_complete,
-        .code_complete = code_complete,
-        .next_sequence = next_sequence,
-        .settled_through_sequence = settled_through_sequence,
-        .api_duration_ms = api_duration_ms,
-        .wall_duration_ms = wall_duration_ms,
-        .total_cost = total_cost,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
-        .cache_read_tokens = cache_read_tokens,
-        .cache_write_tokens = cache_write_tokens,
-        .reasoning_tokens = reasoning_tokens,
-        .request_count = request_count,
-        .billable_web_search_calls = billable_web_search_calls,
-        .lines_added = lines_added,
-        .lines_removed = lines_removed,
-        .models = models,
-        .pending = pending,
-        .publication_backlog = publication_backlog,
-        .incidents = incidents,
-    };
-    return snapshot;
+        const completeness_value = incident.object.get("completeness") orelse
+            return error.InvalidUsageSnapshot;
+        if (completeness_value != .string) return error.InvalidUsageSnapshot;
+        const completeness = std.meta.stringToEnum(
+            usage_report.Completeness,
+            completeness_value.string,
+        ) orelse return error.InvalidUsageSnapshot;
+        incidents[index] = .{
+            .occurred_at_ms = try parseNonNegativeI64(
+                incident.object.get("occurred_at_ms"),
+            ),
+            .completeness = completeness,
+        };
+    }
+    return incidents;
 }
 
 fn parseBool(value: ?std.json.Value) !bool {
@@ -3420,7 +3467,7 @@ fn addOptionalCounter(first: ?u64, second: ?u64) error{UsageOverflow}!?u64 {
 
 pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     const models = try alloc.alloc(ModelAggregate, source.models.len);
-    errdefer alloc.free(models);
+    errdefer mem_utils.free(alloc, models);
     var copied_models: usize = 0;
     errdefer for (models[0..copied_models]) |*model| model.deinit(alloc);
     for (source.models, 0..) |model, index| {
@@ -3429,7 +3476,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     }
 
     const pending = try alloc.alloc(PendingGeneration, source.pending.len);
-    errdefer alloc.free(pending);
+    errdefer mem_utils.free(alloc, pending);
     var copied_pending: usize = 0;
     errdefer for (pending[0..copied_pending]) |*generation| generation.deinit(alloc);
     for (source.pending, 0..) |generation, index| {
@@ -3441,7 +3488,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
         usage_report.GenerationFact,
         source.publication_backlog.len,
     );
-    errdefer alloc.free(publication_backlog);
+    errdefer mem_utils.free(alloc, publication_backlog);
     var copied_publications: usize = 0;
     errdefer for (publication_backlog[0..copied_publications]) |*fact| {
         fact.deinit(alloc);
@@ -3452,7 +3499,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     }
 
     const incidents = try alloc.dupe(usage_report.Incident, source.incidents);
-    errdefer alloc.free(incidents);
+    errdefer mem_utils.free(alloc, incidents);
 
     return .{
         .billing = source.billing,
@@ -5002,7 +5049,7 @@ const TestGenerationUsageProvider = struct {
         return switch (self.outcome) {
             .found => blk: {
                 const id = try alloc.dupe(u8, input.generation_id);
-                errdefer alloc.free(id);
+                errdefer mem_utils.free(alloc, id);
                 const model = try alloc.dupe(u8, "provider/model");
                 break :blk .{ .found = .{
                     .id = id,

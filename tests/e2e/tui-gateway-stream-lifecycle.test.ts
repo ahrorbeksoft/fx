@@ -6061,3 +6061,70 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT,
   );
 });
+
+test.skipIf(!tmuxAvailable())("command rows reclip to the live width while running and after settling", async () => {
+  const stripSgr = (value: string) => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+  const hasToolResult = (raw: string) => {
+    try {
+      const request = JSON.parse(raw);
+      return (request.prompt ?? []).some((m: any) =>
+        Array.isArray(m.content) && m.content.some((p: any) => p.type === "tool-result")
+      );
+    } catch { return false; }
+  };
+
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-live-reclip-")));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
+  const stderr = join(root, "stderr.log");
+  const tail = "y".repeat(60);
+  const longCommand = `printf '${"x".repeat(60)}' && sleep 4 && printf '${tail}'`;
+
+  const host = startDynamicFakeGateway((raw) => {
+    if (raw.includes("Generate a short title")) return fakeGatewayFinalText("reclip");
+    if (hasToolResult(raw)) return fakeGatewayFinalText("RECLIP_LIVE_DONE");
+    return fakeShellRun("reclip-live", longCommand);
+  }, { classifierDecision: "clear" });
+
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      cwd: workspace, width: 200, height: 40, isolated: true, remainOnExit: true, stderrPath: stderr,
+      env: {
+        HOME: home, AI_GATEWAY_API_KEY: "fake-live-reclip", FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+        FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+      },
+    });
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("run the reclip probe");
+
+    // While the command runs, the active row reclips to the live width
+    // instead of keeping the frozen compact-bound marker.
+    await session.waitForPane((pane) => pane.includes("Running printf"), TIMEOUT);
+    const runningRow = stripSgr(await session.capturePane()).split("\n")
+      .find((line) => line.includes("Running printf"));
+    expect(runningRow).toBeDefined();
+    expect(runningRow!).toContain(tail);
+    expect(runningRow!).not.toContain("...");
+
+    // After settling, the completed row keeps the full command too.
+    await session.waitForPane((pane) => pane.includes("RECLIP_LIVE_DONE"), TIMEOUT);
+    const ranRow = stripSgr(await session.captureFullScrollback()).split("\n")
+      .find((line) => line.includes("Ran printf"));
+    expect(ranRow).toBeDefined();
+    expect(ranRow!).toContain(tail);
+    expect(ranRow!).not.toContain("...");
+
+    await session.sendText("/quit");
+    await waitForCondition(() => session!.paneStatus().dead, "fx exit");
+    expect(session.paneStatus().status).toBe(0);
+    session = null;
+    expect(readFileSync(stderr, "utf8")).toBe("");
+  } finally {
+    await session?.kill();
+    host.stop?.();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);

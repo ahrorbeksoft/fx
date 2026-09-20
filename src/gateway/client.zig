@@ -2996,6 +2996,7 @@ fn stringifyJsonValueOwned(alloc: std.mem.Allocator, value: std.json.Value) ![]u
 fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCompletion) void {
     if (completion.content) |content| alloc.free(content);
     if (completion.generation_id) |id| alloc.free(id);
+    if (completion.resolved_provider) |provider| alloc.free(@constCast(provider));
     if (completion.billing) |billing| alloc.free(@constCast(billing.model));
     for (completion.tool_calls) |call| {
         alloc.free(call.id);
@@ -3277,7 +3278,16 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
+}
+
+fn parseSseTokenDetail(usage_value: std.json.Value, section: []const u8, key: []const u8) ?u64 {
+    const section_value = usage_value.object.get(section) orelse return null;
+    if (section_value != .object) return null;
+    const detail = section_value.object.get(key) orelse return null;
+    if (detail != .integer or detail.integer < 0) return null;
+    return @intCast(detail.integer);
 }
 
 fn parseSseTokenTotal(usage_value: std.json.Value, key: []const u8) ?u64 {
@@ -3408,6 +3418,27 @@ fn parseOptionalNullableBillingInteger(
         null;
 }
 
+/// Extracts the gateway's resolved provider slug from finish routing
+/// metadata. Display-only: absent or malformed routing never fails the
+/// stream, it just leaves the completion without routing detail.
+fn parseSseResolvedProvider(alloc: std.mem.Allocator, root: std.json.Value) ?[]const u8 {
+    if (root != .object) return null;
+    const provider_metadata = root.object.get("providerMetadata") orelse return null;
+    if (provider_metadata != .object) return null;
+    const gateway = provider_metadata.object.get("gateway") orelse return null;
+    if (gateway != .object) return null;
+    const routing = gateway.object.get("routing") orelse return null;
+    if (routing != .object) return null;
+    const provider_value = routing.object.get("finalProvider") orelse
+        routing.object.get("resolvedProvider") orelse return null;
+    if (provider_value != .string or provider_value.string.len == 0 or
+        provider_value.string.len > 128) return null;
+    for (provider_value.string) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return null;
+    }
+    return alloc.dupe(u8, provider_value.string) catch null;
+}
+
 fn captureGenerationMetadata(
     alloc: std.mem.Allocator,
     root: std.json.Value,
@@ -3515,6 +3546,8 @@ fn consumeSseStreamTraced(
 
     var finish_reason_holder: ?types.ProviderFinishReason = null;
     var finish_usage: types.Usage = .{};
+    var finish_resolved_provider: ?[]const u8 = null;
+    defer if (finish_resolved_provider) |provider| alloc.free(@constCast(provider));
     var finish_billing: ?types.ProviderBilling = null;
     defer if (finish_billing) |billing| alloc.free(@constCast(billing.model));
     var generation_id: ?[]u8 = null;
@@ -3950,6 +3983,7 @@ fn consumeSseStreamTraced(
             };
             finish_reason_holder = finish_event.finish_reason;
             finish_usage = finish_event.usage;
+            finish_resolved_provider = parseSseResolvedProvider(alloc, root);
             finish_billing = parseSseBilling(
                 alloc,
                 root,
@@ -3989,6 +4023,8 @@ fn consumeSseStreamTraced(
     provider_failure_detail = null;
     completion.generation_id = generation_id;
     generation_id = null;
+    completion.resolved_provider = finish_resolved_provider;
+    finish_resolved_provider = null;
     completion.billing = finish_billing;
     finish_billing = null;
     completion.generation_metadata_invalid = generation_metadata_invalid;
@@ -4186,6 +4222,28 @@ test "consumeSseStream traces rejected terminal billing before fallback" {
     ) != null);
 }
 
+test "consumeSseStream captures the resolved routing provider" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"type\":\"text-start\",\"id\":\"t1\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":1},\"outputTokens\":{\"total\":2}},\"providerMetadata\":{\"gateway\":{\"routing\":{\"originalModelId\":\"anthropic/claude-sonnet-5\",\"resolvedProvider\":\"bedrock\",\"canonicalSlug\":\"anthropic/claude-sonnet-5\",\"finalProvider\":\"bedrock\"}}}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &completion);
+    try std.testing.expectEqualStrings("bedrock", completion.resolved_provider.?);
+
+    const without_routing =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":1},\"outputTokens\":{\"total\":2}}}\n\n";
+    var second_reader = std.Io.Reader.fixed(without_routing);
+    var second_completion = try consumeSseStream(alloc, &second_reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &second_completion);
+    try std.testing.expect(second_completion.resolved_provider == null);
+}
+
 test "consumeSseStream captures exact terminal billing" {
     const payload =
         "data: {\"type\":\"response-metadata\",\"modelId\":\"provider/resolved\",\"timestamp\":\"2026-07-29T03:31:07.000Z\"}\n\n" ++
@@ -4219,6 +4277,43 @@ test "consumeSseStream captures exact terminal billing" {
     try std.testing.expectEqual(@as(u64, 10), billing.cache_write_tokens);
     try std.testing.expectEqual(@as(u64, 5), billing.reasoning_tokens.?);
     try std.testing.expectEqual(@as(u64, 2), billing.billable_web_search_calls);
+}
+
+test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    const payload =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStream(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 25), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), completion.usage.reasoning_tokens);
+
+    const malformed =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"outputTokens\":{\"total\":25,\"reasoning\":\"5\"}}}\n\n";
+    var malformed_reader = std.Io.Reader.fixed(malformed);
+    var malformed_completion = try consumeSseStream(
+        std.testing.allocator,
+        &malformed_reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &malformed_completion);
+    try std.testing.expectEqual(@as(?u64, null), malformed_completion.usage.reasoning_tokens);
 }
 
 test "consumeSseStream ignores malformed finish usage totals" {

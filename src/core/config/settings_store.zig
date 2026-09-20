@@ -896,6 +896,21 @@ pub fn validateModel(model: []const u8) !void {
     }
 }
 
+/// Bounds on the gateway provider routing list (`provider_order`). Slugs are
+/// the gateway's provider identifiers (for example `anthropic`, `bedrock`,
+/// `vertexAnthropic`; case matters).
+pub const max_provider_order_entries: usize = 8;
+pub const max_provider_slug_bytes: usize = 64;
+
+pub fn validateProviderSlug(slug: []const u8) bool {
+    if (slug.len == 0 or slug.len > max_provider_slug_bytes) return false;
+    if (!std.ascii.isAlphanumeric(slug[0])) return false;
+    for (slug) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
+    }
+    return true;
+}
+
 fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_preference) |preference| try validateModel(preference.model);
 }
@@ -1916,7 +1931,21 @@ fn validateKnownSettingsObject(
     if (object.get("context_limits")) |value| {
         _ = context_limits.parseJsonObject(value) catch return error.InvalidSettingsFormat;
     }
-    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged" }) |key| {
+    if (object.get("provider_order")) |value| {
+        // An empty array explicitly clears an inherited routing list.
+        if (value != .array or value.array.items.len > max_provider_order_entries) {
+            return error.InvalidSettingsFormat;
+        }
+        for (value.array.items, 0..) |item, index| {
+            if (item != .string or !validateProviderSlug(item.string)) return error.InvalidSettingsFormat;
+            for (value.array.items[0..index]) |previous| {
+                if (previous == .string and std.mem.eql(u8, item.string, previous.string)) {
+                    return error.InvalidSettingsFormat;
+                }
+            }
+        }
+    }
+    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }

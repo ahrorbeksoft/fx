@@ -3,6 +3,7 @@ const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
+const mem_utils = @import("../../shared/mem_utils.zig");
 const sort_utils = @import("../../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -291,7 +292,7 @@ pub fn parseListPage(
     }
 
     var next_cursor: ?[]u8 = null;
-    errdefer if (next_cursor) |value| alloc.free(value);
+    errdefer if (next_cursor) |value| mem_utils.free(alloc, value);
     if (result.object.get("nextCursor")) |cursor| {
         if (cursor != .string or cursor.string.len > limits.max_cursor_bytes) {
             return error.InvalidListResult;
@@ -469,33 +470,33 @@ fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool
     if (value.object.get("_meta")) |metadata| if (metadata != .object) return error.InvalidTool;
 
     const name = try alloc.dupe(u8, name_value.string);
-    errdefer alloc.free(name);
+    errdefer mem_utils.free(alloc, name);
     const title = if (title_value) |title| try alloc.dupe(u8, title.string) else null;
-    errdefer if (title) |owned| alloc.free(owned);
+    errdefer if (title) |owned| mem_utils.free(alloc, owned);
     const description = try alloc.dupe(u8, if (description_value) |description| description.string else "");
-    errdefer alloc.free(description);
+    errdefer mem_utils.free(alloc, description);
     const input_schema_json = try stringifyValueAlloc(alloc, input_schema, limits.max_schema_bytes);
-    errdefer alloc.free(input_schema_json);
+    errdefer mem_utils.free(alloc, input_schema_json);
     const output_schema_json = if (value.object.get("outputSchema")) |output_schema|
         try stringifyValueAlloc(alloc, output_schema, limits.max_schema_bytes)
     else
         null;
-    errdefer if (output_schema_json) |owned| alloc.free(owned);
+    errdefer if (output_schema_json) |owned| mem_utils.free(alloc, owned);
     const icons_json = if (value.object.get("icons")) |icons|
         try stringifyValueAlloc(alloc, icons, limits.max_metadata_bytes)
     else
         null;
-    errdefer if (icons_json) |owned| alloc.free(owned);
+    errdefer if (icons_json) |owned| mem_utils.free(alloc, owned);
     const annotations_json = if (value.object.get("annotations")) |annotations|
         try stringifyValueAlloc(alloc, annotations, limits.max_metadata_bytes)
     else
         null;
-    errdefer if (annotations_json) |owned| alloc.free(owned);
+    errdefer if (annotations_json) |owned| mem_utils.free(alloc, owned);
     const metadata_json = if (value.object.get("_meta")) |metadata|
         try stringifyValueAlloc(alloc, metadata, limits.max_metadata_bytes)
     else
         null;
-    errdefer if (metadata_json) |owned| alloc.free(owned);
+    errdefer if (metadata_json) |owned| mem_utils.free(alloc, owned);
     return .{
         .name = name,
         .title = title,
@@ -522,7 +523,7 @@ fn parseProtocolError(alloc: Allocator, value: std.json.Value, limits: Limits) E
         return error.InvalidEnvelope;
     }
     const owned_message = try alloc.dupe(u8, message.string);
-    errdefer alloc.free(owned_message);
+    errdefer mem_utils.free(alloc, owned_message);
     const data_json = if (value.object.get("data")) |data|
         try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes)
     else

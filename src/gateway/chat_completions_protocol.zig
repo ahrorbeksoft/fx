@@ -166,6 +166,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
     if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
     // content on user and tool-result messages serializes natively below.

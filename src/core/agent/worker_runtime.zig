@@ -26,6 +26,11 @@ pub const AgentTurnSettings = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    /// Gateway provider routing for turns built from these settings. When set
+    /// on WorkerRuntime.agent_turn_settings the slice is owned by the worker
+    /// and released in WorkerRuntime.deinit; every other copy borrows it.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
 };
 
 pub const SkillBinding = struct {
@@ -506,6 +511,9 @@ pub const WorkerEvent = union(enum) {
     full_detail_record: types.SemanticNotice,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
+    /// The gateway provider that served a request in this turn (display-only,
+    /// last value wins). Owned by the event; the consumer frees it.
+    provider_resolved: []u8,
     api_status_text: []u8,
     credential_refreshed: credentials.Credential,
     command_output: CommandOutputChunk,
@@ -677,6 +685,43 @@ pub const WorkerRuntime = struct {
 
         for (self.worker_events.items) |event| freeWorkerEvent(alloc, event);
         self.worker_events.deinit(alloc);
+
+        if (self.agent_turn_settings.provider_order.len > 0) {
+            for (self.agent_turn_settings.provider_order) |slug| alloc.free(@constCast(slug));
+            alloc.free(self.agent_turn_settings.provider_order);
+            self.agent_turn_settings.provider_order = &.{};
+        }
+    }
+
+    /// Copies a gateway provider routing list into worker ownership for
+    /// subsequent turns. `alloc` must match the allocator later passed to
+    /// deinit (hosts use the C allocator for worker-owned memory). Copied
+    /// turn settings borrow the worker-owned list.
+    pub fn setProviderRouting(self: *WorkerRuntime, alloc: std.mem.Allocator, order: []const []const u8, strict: bool) !void {
+        var owned: []const []const u8 = &.{};
+        if (order.len > 0) {
+            const slugs = try alloc.alloc([]const u8, order.len);
+            var filled: usize = 0;
+            errdefer {
+                for (slugs[0..filled]) |slug| alloc.free(@constCast(slug));
+                alloc.free(slugs);
+            }
+            for (order, 0..) |slug, index| {
+                slugs[index] = try alloc.dupe(u8, slug);
+                filled += 1;
+            }
+            owned = slugs;
+        }
+        if (self.agent_turn_settings.provider_order.len > 0) {
+            for (self.agent_turn_settings.provider_order) |slug| alloc.free(@constCast(slug));
+            alloc.free(self.agent_turn_settings.provider_order);
+        }
+        self.agent_turn_settings.provider_order = owned;
+        self.agent_turn_settings.provider_strict = strict;
+        for (self.queued_prompts.items) |*prompt| {
+            prompt.agent_settings.provider_order = owned;
+            prompt.agent_settings.provider_strict = strict;
+        }
     }
 
     pub fn requestStop(self: *WorkerRuntime) void {
@@ -3982,6 +4027,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .full_detail_record => |notice| .{ .full_detail_record = try types.dupeSemanticNotice(alloc, notice) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
+        .provider_resolved => |slug| .{ .provider_resolved = try alloc.dupe(u8, slug) },
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .credential_refreshed => |credential| .{
             .credential_refreshed = try credential.clone(alloc),
@@ -4085,6 +4131,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .full_detail_record => |notice| types.freeSemanticNotice(alloc, notice),
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
+        .provider_resolved => |slug| alloc.free(slug),
         .api_status_text => |text| alloc.free(text),
         .credential_refreshed => |credential| {
             var owned = credential;

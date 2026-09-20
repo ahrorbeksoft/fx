@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const mcp_auth = @import("mcp_auth.zig");
@@ -325,16 +326,16 @@ pub fn prepare(
             "MCP tool";
 
         const original_name = try alloc.dupe(u8, name);
-        errdefer alloc.free(original_name);
+        errdefer mem_utils.free(alloc, original_name);
 
         const prefixed_name = try used_tool_names.name(alloc, tool_registry, server.config.name, name);
-        errdefer alloc.free(prefixed_name);
+        errdefer mem_utils.free(alloc, prefixed_name);
 
         const owned_description = try alloc.dupe(u8, description);
-        errdefer alloc.free(owned_description);
+        errdefer mem_utils.free(alloc, owned_description);
 
         const input_schema_json = try alloc.dupe(u8, protocol_tool.input_schema_json);
-        errdefer alloc.free(input_schema_json);
+        errdefer mem_utils.free(alloc, input_schema_json);
         if (server.config.transport == .http and protocol == .modern) {
             streamable_http.validateToolInputSchemaHeaders(
                 alloc,
@@ -358,15 +359,15 @@ pub fn prepare(
         errdefer freeOwnedStrings(alloc, tags);
 
         const title = if (protocol_tool.title) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (title) |value| alloc.free(value);
+        errdefer if (title) |value| mem_utils.free(alloc, value);
         const output_schema_json = if (protocol_tool.output_schema_json) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (output_schema_json) |value| alloc.free(value);
+        errdefer if (output_schema_json) |value| mem_utils.free(alloc, value);
         const icons_json = if (protocol_tool.icons_json) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (icons_json) |value| alloc.free(value);
+        errdefer if (icons_json) |value| mem_utils.free(alloc, value);
         const annotations_json = if (protocol_tool.annotations_json) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (annotations_json) |value| alloc.free(value);
+        errdefer if (annotations_json) |value| mem_utils.free(alloc, value);
         const metadata_json = if (protocol_tool.metadata_json) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (metadata_json) |value| alloc.free(value);
+        errdefer if (metadata_json) |value| mem_utils.free(alloc, value);
 
         try result.tools.ensureUnusedCapacity(alloc, 1);
         result.tools.appendAssumeCapacity(.{

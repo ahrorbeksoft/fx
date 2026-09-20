@@ -149,6 +149,10 @@ pub const StartupState = struct {
     prompt_history_store_allowed: bool = true,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
+    /// Owned gateway provider slugs in preference order; empty leaves routing
+    /// to the gateway.
+    provider_order: [][]const u8 = &.{},
+    provider_strict: bool = false,
     /// Resolved review-model override for automatic permission review. Owned;
     /// empty keeps the reviewer's compiled default.
     review_model: []u8 = &.{},
@@ -171,6 +175,10 @@ pub const StartupState = struct {
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         if (self.review_model.len > 0) alloc.free(self.review_model);
+        if (self.provider_order.len > 0) {
+            for (self.provider_order) |slug| alloc.free(@constCast(slug));
+            alloc.free(self.provider_order);
+        }
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -250,6 +258,30 @@ pub const StartupState = struct {
             // footer indicator reflects it; --no-fast clears the binding.
             self.fast_mode_model_bound = value;
         }
+    }
+
+    /// Applies per-launch `--provider-order`/`--provider-strict` flags. Like
+    /// the turn overrides, flags shape this launch only and never rewrite
+    /// stored settings.
+    pub fn applyLaunchProviderRouting(self: *StartupState, alloc: Allocator, order: ?[]const []const u8, strict: ?bool) !void {
+        if (order) |slugs| {
+            const owned = try alloc.alloc([]const u8, slugs.len);
+            var filled: usize = 0;
+            errdefer {
+                for (owned[0..filled]) |slug| alloc.free(@constCast(slug));
+                alloc.free(owned);
+            }
+            for (slugs, 0..) |slug, index| {
+                owned[index] = try alloc.dupe(u8, slug);
+                filled += 1;
+            }
+            if (self.provider_order.len > 0) {
+                for (self.provider_order) |slug| alloc.free(@constCast(slug));
+                alloc.free(self.provider_order);
+            }
+            self.provider_order = owned;
+        }
+        if (strict) |value| self.provider_strict = value;
     }
 
     pub fn takePermissionRules(self: *StartupState) types.PermissionRuleSet {
@@ -607,6 +639,20 @@ fn loadStartupStateFromOwnedWorkspace(
     state.effort = settings.effort orelse .auto;
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
+    state.provider_strict = settings.provider_strict orelse false;
+    if (settings.provider_order) |order| {
+        const owned_order = try alloc.alloc([]const u8, order.len);
+        var filled: usize = 0;
+        errdefer {
+            for (owned_order[0..filled]) |slug| alloc.free(@constCast(slug));
+            alloc.free(owned_order);
+        }
+        for (order, 0..) |slug, index| {
+            owned_order[index] = try alloc.dupe(u8, slug);
+            filled += 1;
+        }
+        state.provider_order = owned_order;
+    }
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
     state.statusline_workspace = settings.statusline_workspace orelse false;

@@ -8824,3 +8824,87 @@ test "assistant retention preserves physical rows inside a protected wrapped ent
         try expectRetentionRows(&probe, &h, 123);
     }
 }
+
+test "command tool rows reclip to live width across lifecycle states" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 200, 30, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    // A 152-byte command: past the 120-byte compact activity bound, so its
+    // status phrases carry the frozen "..." marker at generation time.
+    const command = "printf '" ++ ("x" ** 60) ++ "' && sleep 1 && printf '" ++ ("y" ** 60) ++ "'";
+    const frozen_command = command[0..117] ++ "...";
+    const full_tail = "y" ** 60;
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-live" };
+    const args_json = try std.fmt.allocPrint(alloc, "{{\"command\":{f}}}", .{std.json.fmt(command, .{})});
+    defer alloc.free(args_json);
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = args_json,
+    } });
+    // Start-time metadata store, mirroring the worker callback: the full
+    // reflow-bound command plus the predicted completed label.
+    try h.shell.setToolCommandMetadata(alloc, id, command, "Ran");
+    // The active status phrase is generated at the compact bound.
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{
+        .id = id,
+        .text = "● Running " ++ frozen_command,
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    // The active row reclips to the live width and keeps its own label.
+    try expectGridContains(&h, "Running " ++ command);
+    try expectGridNotContains(&h, frozen_command);
+
+    // Settled success: the frozen "Ran" phrase reclips the same way.
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran " ++ frozen_command },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "Ran " ++ command);
+    try expectGridNotContains(&h, frozen_command);
+
+    // Settled with a nonzero exit: the settled label carries the exit code,
+    // which the start-time predicted label ("Ran") cannot know.
+    const failed_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-failed" };
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = failed_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = args_json,
+    } });
+    try h.shell.setToolCommandMetadata(alloc, failed_id, command, "Ran");
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = failed_id,
+        .outcome = .{ .kind = .completed, .summary = "Exited 1 " ++ frozen_command },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "Exited 1 " ++ command);
+    try expectGridNotContains(&h, frozen_command);
+
+    // Reclipped rows still respect the live width: narrow them and the row
+    // folds to the width with the single-cell clip marker, not the frozen
+    // generation marker.
+    try h.driveResize(90, 30, 4, true);
+    try expectGridNotContains(&h, full_tail);
+    try h.driveResize(200, 30, 4, true);
+    try expectGridContains(&h, "Exited 1 " ++ command);
+}

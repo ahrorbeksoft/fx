@@ -3,6 +3,7 @@ const common = @import("common.zig");
 const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
 const mrtr = @import("../mrtr.zig");
+const mem_utils = @import("../../shared/mem_utils.zig");
 const sort_utils = @import("../../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -340,7 +341,7 @@ pub fn parseResourcePage(alloc: Allocator, response: []const u8, protocol: Proto
         count += 1;
     }
     const next_cursor = try parseCursor(alloc, result, limits.max_cursor_bytes);
-    errdefer if (next_cursor) |cursor| alloc.free(cursor);
+    errdefer if (next_cursor) |cursor| mem_utils.free(alloc, cursor);
     return .{ .items = items, .next_cursor = next_cursor, .cache = try common.parseCacheHints(alloc, result) };
 }
 
@@ -361,7 +362,7 @@ pub fn parseTemplatePage(alloc: Allocator, response: []const u8, protocol: Proto
         count += 1;
     }
     const next_cursor = try parseCursor(alloc, result, limits.max_cursor_bytes);
-    errdefer if (next_cursor) |cursor| alloc.free(cursor);
+    errdefer if (next_cursor) |cursor| mem_utils.free(alloc, cursor);
     return .{ .items = items, .next_cursor = next_cursor, .cache = try common.parseCacheHints(alloc, result) };
 }
 
@@ -820,7 +821,7 @@ fn parseDescriptor(alloc: Allocator, value: std.json.Value, limits: common.Limit
     const fields = try parseDescriptorFields(alloc, value.object, limits);
     errdefer fields.deinit(alloc);
     const owned_uri = try alloc.dupe(u8, uri);
-    errdefer alloc.free(owned_uri);
+    errdefer mem_utils.free(alloc, owned_uri);
     const owned_name = try alloc.dupe(u8, name);
     return .{
         .uri = owned_uri,
@@ -843,7 +844,7 @@ fn parseTemplate(alloc: Allocator, value: std.json.Value, limits: common.Limits)
     const fields = parseDescriptorFields(alloc, value.object, limits) catch return error.InvalidTemplate;
     errdefer fields.deinit(alloc);
     const owned_uri_template = try alloc.dupe(u8, uri_template);
-    errdefer alloc.free(owned_uri_template);
+    errdefer mem_utils.free(alloc, owned_uri_template);
     const owned_name = try alloc.dupe(u8, name);
     return .{
         .uri_template = owned_uri_template,
@@ -891,21 +892,21 @@ fn parseDescriptorFields(alloc: Allocator, object: std.json.ObjectMap, limits: c
     else
         null;
     const owned_title = if (title) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (owned_title) |value| alloc.free(value);
+    errdefer if (owned_title) |value| mem_utils.free(alloc, value);
     const owned_description = if (description) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (owned_description) |value| alloc.free(value);
+    errdefer if (owned_description) |value| mem_utils.free(alloc, value);
     const owned_mime_type = if (mime_type) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (owned_mime_type) |value| alloc.free(value);
+    errdefer if (owned_mime_type) |value| mem_utils.free(alloc, value);
     const icons_json = if (object.get("icons")) |value|
         try common.stringifyValueAlloc(alloc, value, limits.max_metadata_bytes, limits.max_json_depth)
     else
         null;
-    errdefer if (icons_json) |value| alloc.free(value);
+    errdefer if (icons_json) |value| mem_utils.free(alloc, value);
     const annotations_json = if (object.get("annotations")) |value|
         try common.stringifyValueAlloc(alloc, value, limits.max_metadata_bytes, limits.max_json_depth)
     else
         null;
-    errdefer if (annotations_json) |value| alloc.free(value);
+    errdefer if (annotations_json) |value| mem_utils.free(alloc, value);
     const metadata_json = if (object.get("_meta")) |value|
         try common.stringifyValueAlloc(alloc, value, limits.max_metadata_bytes, limits.max_json_depth)
     else
@@ -942,7 +943,7 @@ fn validatePageTransition(
     }
     if (next_cursor) |cursor| {
         const owned = try alloc.dupe(u8, cursor);
-        errdefer alloc.free(owned);
+        errdefer mem_utils.free(alloc, owned);
         try cursors.put(owned, {});
     }
     pages.* = next_pages;

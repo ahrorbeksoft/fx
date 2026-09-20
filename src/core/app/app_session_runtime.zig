@@ -1818,7 +1818,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer display.deinit(app.alloc);
-            hydrateResumedSession(app, loaded.state, display.title, notice) catch |err| {
+            hydrateResumedSession(app, loaded.state, &display, notice) catch |err| {
                 traceJsHostRestoreFailure("hydrate", session_id, err);
                 try continueWithFreshJsHostSession(app);
                 return;
@@ -1949,7 +1949,7 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.writable = null;
             }
             const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title, notice);
+            try hydrateResumedSession(app, active.state, &display, notice);
             active.releaseHydrationHistory(app.alloc);
             enableSessionStores(app);
         }
@@ -1976,7 +1976,7 @@ pub fn Runtime(comptime App: type) type {
         fn hydrateResumedSession(
             app: *App,
             state: session_codec.DurableSessionState,
-            display_title: []const u8,
+            display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
             const previous_provider = provider_runtime.provider(app);
@@ -2032,10 +2032,9 @@ pub fn Runtime(comptime App: type) type {
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
-                    .workspace_root = resume_workspace_root,
                     .labels = &historical_labels,
                 };
-                try writeResumeNotice(app, &sink, display_title, notice);
+                try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
                 try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
@@ -2055,7 +2054,7 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, &sink, display_title, notice);
+                try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
                 try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
             }
@@ -3508,7 +3507,6 @@ pub fn Runtime(comptime App: type) type {
             return struct {
                 app: *App,
                 projection: *Projection,
-                workspace_root: []const u8,
                 labels: *const HistoricalSessionLabels,
 
                 const Self = @This();
@@ -3574,10 +3572,17 @@ pub fn Runtime(comptime App: type) type {
                         try self.attachSessionCommandDisplay(entry_id, call);
                         return;
                     }
+                    // Use the app's live workspace root, not the sink's: the
+                    // sink root is blanked whenever the session moved
+                    // workspaces, which is the right policy for terminal
+                    // session labels (they fall back to the raw session id)
+                    // but must not withhold reclip metadata here. The replayed
+                    // status phrases are generated with the app root too, so
+                    // this keeps both halves of the row consistent.
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
                         command_value.string,
-                        self.workspace_root,
+                        self.app.workspace_root,
                         tooling_presentation.max_run_command_reflow_bytes,
                     ) catch |err| blk: {
                         debug_trace.logf(
@@ -3999,15 +4004,18 @@ pub fn Runtime(comptime App: type) type {
         fn writeResumeNotice(
             app: *App,
             sink: anytype,
-            display_title: []const u8,
+            display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
-            try setCachedSessionTitle(app, display_title);
+            // Only a real title enters the cache: the fallback placeholder must
+            // not count as an existing title, or background title generation
+            // would consider the session already named and never run.
+            if (display.present) try setCachedSessionTitle(app, display.title);
             switch (notice) {
                 .session => try sink.appendNotice(.{
                     .topic = "session resumed",
                     .tone = .neutral,
-                    .body = display_title,
+                    .body = display.title,
                 }),
                 .upgrade => |upgrade| {
                     var body: std.Io.Writer.Allocating = .init(app.alloc);
@@ -4155,7 +4163,6 @@ pub fn Runtime(comptime App: type) type {
             var sink = DetachedHistorySink(@TypeOf(projection.*)){
                 .app = app,
                 .projection = projection,
-                .workspace_root = app.workspace_root,
                 .labels = &labels,
             };
             return replayHistoryToSinkIncremental(
@@ -7158,7 +7165,6 @@ test "resume projection stores reflow metadata for session action rows" {
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
         .app = &app,
         .projection = &projection,
-        .workspace_root = app.workspace_root,
         .labels = &labels,
     };
 
@@ -7235,6 +7241,64 @@ test "resume projection stores reflow metadata for session action rows" {
         const display = detail.command_display orelse continue;
         try std.testing.expect(std.mem.find(u8, display, "shell-9") == null);
     }
+}
+
+test "resume projection stores reflow metadata after the session moved workspaces" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    // A session whose origin and current workspace roots differ blanks the
+    // replay root for terminal-session labels. Command reclip metadata must
+    // still resolve against the app's live root: the replayed status phrases
+    // are generated with that same root, and withholding the metadata would
+    // freeze every absolute-path command row at the compact activity bound.
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "" };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    const command = "cd /workspace/packages/cli && " ++ ("printf relative-path " ** 6);
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+    }};
+    defer alloc.free(run_calls[0].arguments_json);
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    var stored = false;
+    for (projection.runtime.tool_details.items) |*detail| {
+        const display = detail.command_display orelse continue;
+        if (std.mem.eql(u8, detail.command_action_label orelse "", "Ran")) {
+            // Abbreviated against the live root, full length, never the
+            // compact-bound frozen form.
+            try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
+            try std.testing.expect(display.len > 120);
+            stored = true;
+        }
+    }
+    try std.testing.expect(stored);
 }
 
 test "execution replay renders persisted permission feedback after its tool result" {
@@ -8240,6 +8304,83 @@ test "upgrade resume restores active session with the installed version notice" 
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.effort);
     try std.testing.expect(!app.fast_mode);
+}
+
+test "upgrade resume of a pristine session leaves the title cache empty for generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    const history = [_]types.HistoryTurn{};
+    try writeSessionFixture(alloc, app.session_persistence.store.?, "session-empty", &history, 0);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-empty") };
+
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
+        &app,
+        "9.9.9",
+        .stable,
+        "",
+        "",
+    );
+
+    // The fallback placeholder must not be cached as a title: the session is
+    // still untitled, so its first prompt can start title generation.
+    try std.testing.expectEqual(@as(usize, 0), app.session_title.items.len);
+}
+
+test "upgrade resume caches the derived title for a session with usable history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("hello") },
+            .assistant = @constCast("hi"),
+        } },
+    };
+    try writeSessionFixture(alloc, app.session_persistence.store.?, "session-hello", &history, 0);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-hello") };
+
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
+        &app,
+        "9.9.9",
+        .stable,
+        "",
+        "",
+    );
+
+    try std.testing.expectEqualStrings("hello", app.session_title.items);
 }
 
 test "resumed recovery checkpoint replays its unfinished turn once" {

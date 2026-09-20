@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const server_auth = @import("server_auth.zig");
 const catalog_freshness = @import("catalog_freshness.zig");
@@ -272,9 +273,9 @@ pub fn cloneFeatureSnapshot(
     metadata: catalog_freshness.SnapshotMetadata,
 ) !Snapshot {
     const server_name = try alloc.dupe(u8, server.config.name);
-    errdefer alloc.free(server_name);
+    errdefer mem_utils.free(alloc, server_name);
     const owned_identity = try alloc.dupe(u8, identity);
-    errdefer alloc.free(owned_identity);
+    errdefer mem_utils.free(alloc, owned_identity);
     const owned_uri = if (requested_uri) |value| try alloc.dupe(u8, value) else null;
     return .{
         .server_name = server_name,

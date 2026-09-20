@@ -1,6 +1,7 @@
 const std = @import("std");
 const server_connection = @import("server_connection.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const tool_catalog = @import("tool_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const types = @import("../shared/types.zig");
@@ -19,9 +20,9 @@ pub fn snapshotServerHealthBeforeDiscoveryPublication(
     discovering: bool,
 ) !health.ServerSnapshot {
     const configured_name = try terminalSafeOwned(alloc, server.config.name, 256);
-    errdefer alloc.free(configured_name);
+    errdefer mem_utils.free(alloc, configured_name);
     const identity_name = try alloc.dupe(u8, server.config.name);
-    errdefer alloc.free(identity_name);
+    errdefer mem_utils.free(alloc, identity_name);
     const connection: health.ConnectionState = if (!server.config.enabled)
         .disabled
     else if (discovering)
@@ -34,6 +35,7 @@ pub fn snapshotServerHealthBeforeDiscoveryPublication(
         server.config.required,
         connection,
         authentication,
+        server.config.name,
         null,
     );
     return .{
@@ -69,24 +71,24 @@ pub fn snapshotServerHealth(
     cache_now_ms: u64,
 ) !health.ServerSnapshot {
     const configured_name = try terminalSafeOwned(alloc, server.config.name, 256);
-    errdefer alloc.free(configured_name);
+    errdefer mem_utils.free(alloc, configured_name);
     const identity_name = try alloc.dupe(u8, server.config.name);
-    errdefer alloc.free(identity_name);
+    errdefer mem_utils.free(alloc, identity_name);
     const negotiated_name = if (server.negotiated_server_name) |value|
         try terminalSafeOwned(alloc, value, 256)
     else
         null;
-    errdefer if (negotiated_name) |value| alloc.free(value);
+    errdefer if (negotiated_name) |value| mem_utils.free(alloc, value);
     const negotiated_version = if (server.negotiated_server_version) |value|
         try terminalSafeOwned(alloc, value, 128)
     else
         null;
-    errdefer if (negotiated_version) |value| alloc.free(value);
+    errdefer if (negotiated_version) |value| mem_utils.free(alloc, value);
     const protocol_version = if (server.negotiated_protocol_version.len > 0)
         try terminalSafeOwned(alloc, server.negotiated_protocol_version, 128)
     else
         null;
-    errdefer if (protocol_version) |value| alloc.free(value);
+    errdefer if (protocol_version) |value| mem_utils.free(alloc, value);
     const published_connection: health.ConnectionState = switch (server.state.load(.acquire)) {
         .disconnected => .disconnected,
         .disabled => .disabled,
@@ -107,9 +109,10 @@ pub fn snapshotServerHealth(
         server.config.required,
         connection,
         authentication,
+        server.config.name,
         server.last_error,
     );
-    errdefer if (failure) |value| alloc.free(value);
+    errdefer if (failure) |value| mem_utils.free(alloc, value);
     return .{
         .configured_name = configured_name,
         .identity_name = identity_name,
@@ -182,7 +185,7 @@ pub fn snapshotServerModelSummary(
     deferred_pending: bool,
 ) !model_catalog.ServerSummary {
     const name = try alloc.dupe(u8, server.config.name);
-    errdefer alloc.free(name);
+    errdefer mem_utils.free(alloc, name);
     const published_connection: health.ConnectionState = switch (server.state.load(.acquire)) {
         .disconnected => .disconnected,
         .disabled => .disabled,
@@ -234,26 +237,35 @@ pub fn healthFailureForState(
     required: bool,
     connection: health.ConnectionState,
     authentication: health.AuthenticationState,
+    name: []const u8,
     last_error: ?[]const u8,
 ) Allocator.Error!?[]u8 {
-    if (required and connection == .disabled) {
-        return @as(?[]u8, try alloc.dupe(u8, "Enable this required server or mark it optional."));
+    switch (health.classify(connection, authentication, false)) {
+        .disabled => {
+            if (required) {
+                return @as(?[]u8, try alloc.dupe(u8, "Enable this required server or mark it optional."));
+            }
+            return null;
+        },
+        .needs_auth => {
+            const safe_name = try terminalSafeOwned(alloc, name, 256);
+            defer alloc.free(safe_name);
+            return @as(?[]u8, try std.fmt.allocPrint(
+                alloc,
+                "Authentication is required or the saved credentials lack access; run /mcp auth {s} --open and check server permissions.",
+                .{safe_name},
+            ));
+        },
+        .failed => {
+            if (last_error) |message| {
+                const masked = text_utils.maskSecrets(alloc, message) catch return error.OutOfMemory;
+                defer if (masked.ptr != message.ptr) alloc.free(masked);
+                return try terminalSafeOwned(alloc, masked, 1024);
+            }
+            return @as(?[]u8, try alloc.dupe(u8, "Connection or discovery failed; check the trusted profile configuration and trace logs."));
+        },
+        .connecting, .ready, .unavailable, .on_demand => return null,
     }
-    if (authentication == .required) {
-        return @as(?[]u8, try alloc.dupe(
-            u8,
-            "Authentication is required or the saved credentials lack access; run /mcp auth <name> --open and check server permissions.",
-        ));
-    }
-    if (connection == .failed) {
-        if (last_error) |message| {
-            const masked = text_utils.maskSecrets(alloc, message) catch return error.OutOfMemory;
-            defer if (masked.ptr != message.ptr) alloc.free(masked);
-            return try terminalSafeOwned(alloc, masked, 1024);
-        }
-        return @as(?[]u8, try alloc.dupe(u8, "Connection or discovery failed; check the trusted profile configuration and trace logs."));
-    }
-    return null;
 }
 
 fn aggregateCacheFreshness(server: *const McpServer, now_ms: u64) health.CacheFreshness {

@@ -419,6 +419,7 @@ pub fn Runtime(comptime App: type) type {
                 .notification,
                 .question_requested,
                 .clear_route_recovery_status,
+                .provider_resolved,
                 .api_status_text,
                 .context_compaction,
                 .prepare_fresh_prompt,
@@ -1132,6 +1133,10 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.render_requests.request(.footer);
                         }
                     },
+                    // The serving provider already appears on the ctrl+o
+                    // network record; nothing interactive consumes the event
+                    // today. The batch drain frees the payload.
+                    .provider_resolved => {},
                     .api_status_text => |text| {
                         resetStream(app, false);
                         app.shell.worker_status_state().set_api(text, .danger);

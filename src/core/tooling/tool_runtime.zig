@@ -146,6 +146,11 @@ pub const Context = struct {
     agent_step_limit: usize,
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    /// Borrowed gateway provider routing inherited by subagent turns. Never
+    /// applied to tool-internal provider requests (vision, web search), which
+    /// keep gateway-default routing.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,

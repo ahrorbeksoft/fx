@@ -6,6 +6,13 @@ pub const ResolvedProviderOptions = struct {
     fast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
+    /// Borrowed gateway provider slugs in preference order. Empty leaves
+    /// provider selection to the gateway. The backing memory must outlive
+    /// request-body serialization.
+    provider_order: []const []const u8 = &.{},
+    /// Sends `provider_order` as the gateway's hard `only` restriction
+    /// instead of its `order` preference.
+    provider_strict: bool = false,
 };
 
 pub const ReasoningEffortOptions = struct {

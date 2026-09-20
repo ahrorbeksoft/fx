@@ -48,6 +48,13 @@ pub const Config = struct {
     review_enabled: bool = false,
     fast_mode: bool = false,
     effort: ReasoningEffort = .auto,
+    /// Borrowed gateway provider slugs in preference order; empty leaves
+    /// routing to the gateway. Backing memory is owned by the caller and must
+    /// outlive every request built from this config.
+    provider_order: []const []const u8 = &.{},
+    /// Sends `provider_order` as the gateway's hard `only` restriction instead
+    /// of its `order` preference.
+    provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,

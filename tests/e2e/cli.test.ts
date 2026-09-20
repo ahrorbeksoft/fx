@@ -383,27 +383,30 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
-  --auto                Automatically review unresolved permission requests
-  --full-access         Disable fx permission checks
-  --yolo                Alias for --full-access
-  --model <id>          Override the model for this request
-  --effort <level>      Override the reasoning effort for this request
-  --fast                Enable Fast mode for this request when the model supports it
-  --no-fast             Disable Fast mode for this request
-  --image PATH          Attach an image file; repeat for multiple images
-  --system TEXT         Replace the built-in system prompt for this request
-  --json                Emit machine-readable JSON instead of text
-  --quiet               Suppress assistant output
-  --prompt-permissions  Prompt for Y/N permission approval when stdin is a TTY
-  --no-save             Do not save the session; incompatible with --resume and --resume-id
-  --no-color            Render TTY output without colors or hyperlinks
-  --resume <last|id>    Continue the last session or a session by id
-  --resume-id <id>      Continue a session by exact id
-  --continue-recovery   Resume the paused model response in the selected session
-  --                    Treat every following argument as prompt text
+  --auto                      Automatically review unresolved permission requests
+  --full-access               Disable fx permission checks
+  --yolo                      Alias for --full-access
+  --model <id>                Override the model for this request
+  --effort <level>            Override the reasoning effort for this request
+  --fast                      Enable Fast mode for this request when the model supports it
+  --no-fast                   Disable Fast mode for this request
+  --provider-order <a,b,...>  Prefer these gateway providers in order for this request
+  --provider-strict           Restrict this request to only the providers in --provider-order
+  --no-provider-strict        Clear the provider restriction for this request
+  --image PATH                Attach an image file; repeat for multiple images
+  --system TEXT               Replace the built-in system prompt for this request
+  --json                      Emit machine-readable JSON instead of text
+  --quiet                     Suppress assistant output
+  --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
+  --no-save                   Do not save the session; incompatible with --resume and --resume-id
+  --no-color                  Render TTY output without colors or hyperlinks
+  --resume <last|id>          Continue the last session or a session by id
+  --resume-id <id>            Continue a session by exact id
+  --continue-recovery         Resume the paused model response in the selected session
+  --                          Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
@@ -4099,7 +4102,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -4934,7 +4937,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);

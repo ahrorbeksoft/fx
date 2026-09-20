@@ -653,25 +653,51 @@ fn formatGroupBlock(
     return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
 }
 
-/// Substitutes the stored full command for a settled status phrase that was
-/// truncated to the compact activity bound at generation time. Records carry
-/// the full display whenever the command is known — captured runs, tty runs,
-/// and terminal-session actions — so the phrase can be reclipped to the live
+/// The minimum tail length accepted as an identity match in
+/// reprojectTruncatedCommandPhrase. Genuinely truncated command phrases carry
+/// roughly 116 bytes of command prefix (the compact activity bound), so a long
+/// threshold cannot reject a real row; it exists to stop a short coincidental
+/// tail from rewriting an unrelated one.
+const min_reclip_tail_bytes = 16;
+
+/// Returns the longest suffix of `text` that is also a prefix of `base`, when
+/// it is long enough to prove the two share a command. O(n^2) over a frozen
+/// phrase of at most ~120 bytes; the loop count is bounded and tiny.
+fn commandTailMatch(text: []const u8, base: []const u8) ?[]const u8 {
+    var len: usize = @min(text.len, base.len);
+    while (len >= min_reclip_tail_bytes) : (len -= 1) {
+        const tail = text[text.len - len ..];
+        if (std.mem.startsWith(u8, base, tail)) return tail;
+    }
+    return null;
+}
+
+/// Substitutes the stored full command for a status phrase that was truncated
+/// to the compact activity bound at generation time. Records carry the full
+/// display whenever the command is known — captured runs, tty runs, and
+/// terminal-session actions — so the phrase can be reclipped to the live
 /// terminal width instead of keeping the frozen "..." marker.
+///
+/// The row's own leading label is preserved ("Running", "Ran", "Exited 1"):
+/// the stored action label is a start-time prediction that cannot know the
+/// settled outcome, and an active row must never be rewritten to the
+/// completed label. Identity is proven by the command itself — the frozen
+/// tail is a generation-time prefix of the stored display — which is a
+/// stronger guard than comparing the predicted label against the row.
 fn reprojectTruncatedCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
     detail: ?*const ToolDetailRecord,
 ) !?[]const u8 {
     const record = detail orelse return null;
-    if (record.outcome != .completed) return null;
     if (!std.mem.endsWith(u8, phrase, "...")) return null;
     const command = record.command_display orelse return null;
-    const action = record.command_action_label orelse return null;
-    // The stored pair must match the phrase it replaces: a record carrying a
-    // mismatched label would rewrite an unrelated row.
-    if (!std.mem.startsWith(u8, phrase, action)) return null;
-    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
+    if (command.len == 0) return null;
+    const body = phrase[0 .. phrase.len - "...".len];
+    const tail = commandTailMatch(body, command) orelse return null;
+    const label = body[0 .. body.len - tail.len];
+    if (label.len == 0 or label[label.len - 1] != ' ') return null;
+    return try std.fmt.allocPrint(scratch, "{s}{s}", .{ label, command });
 }
 
 /// Shell-highlight the command portion of a command phrase ("Running <cmd>",
@@ -1951,9 +1977,8 @@ test "expanded group children reproject stored commands at the current width" {
     try std.testing.expect(std.mem.find(u8, narrow.entry_actions.items[0].override.bytes, "...") == null);
 }
 
-test "command reprojection rejects a phrase that does not start with the stored action label" {
+test "command reprojection rejects a record carrying a different command" {
     const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
@@ -1965,17 +1990,81 @@ test "command reprojection rejects a phrase that does not start with the stored 
         .entry_id = 1,
         .tool_name = @constCast("shell"),
         .activity_kind = .command,
-        .command_display = @constCast(command),
-        .command_action_label = @constCast("Observed"),
+        .command_display = @constCast("zig build test --release"),
+        .command_action_label = @constCast("Ran"),
         .outcome = .completed,
         .command_process_presentation = .{ .exit_code = 0 },
     }};
 
     var projection = try build(alloc, &entries, &details, 240);
     defer projection.deinit(alloc);
-    // The frozen phrase stays untouched when the stored label does not lead it.
+    // The frozen tail is no prefix of the stored command, so the row is left
+    // untouched rather than rewritten with unrelated content.
     try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, "..."));
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "Observed") == null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "zig build") == null);
+}
+
+test "command reprojection keeps the row's own label across lifecycle states" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const frozen_tail = "printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-";
+
+    const Case = struct {
+        label: []const u8,
+        outcome: ?types.ToolOutcomeKind,
+        stored_action: []const u8,
+    };
+    const cases = [_]Case{
+        // Active row: outcome not yet set, stored label is the start-time
+        // prediction. The live row must keep "Running", never flip to "Ran".
+        .{ .label = "Running", .outcome = null, .stored_action = "Ran" },
+        // Plain success: the historical happy path.
+        .{ .label = "Ran", .outcome = .completed, .stored_action = "Ran" },
+        // Nonzero exit: the tool completed but the settled label carries the
+        // exit code the start-time prediction could not know.
+        .{ .label = "Exited 1", .outcome = .completed, .stored_action = "Ran" },
+        // Failed tool outcome with a divergent settled label.
+        .{ .label = "Failed", .outcome = .failed, .stored_action = "Observed" },
+    };
+
+    for (cases, 0..) |case, index| {
+        const bytes = try std.fmt.allocPrint(
+            alloc,
+            "● {s}\x1b[0m \x1b[38;5;245m{s}...\x1b[0m\n",
+            .{ case.label, frozen_tail },
+        );
+        defer alloc.free(bytes);
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = @intCast(index + 1), .bytes = bytes, .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{.{
+            .entry_id = @intCast(index + 1),
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .command_display = @constCast(command),
+            .command_action_label = @constCast(case.stored_action),
+            .outcome = case.outcome,
+        }};
+
+        var projection = try build(alloc, &entries, &details, 240);
+        defer projection.deinit(alloc);
+        const row = projection.entry_actions.items[0].override.bytes;
+
+        // The frozen marker is gone, the full command is present, and the
+        // row keeps its own label rather than the stored prediction.
+        try std.testing.expect(std.mem.find(u8, row, "...") == null);
+        try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
+        const expected_prefix = try std.fmt.allocPrint(alloc, "\n└ {s} ", .{case.label});
+        defer alloc.free(expected_prefix);
+        try std.testing.expect(std.mem.find(u8, row, expected_prefix) != null);
+    }
+}
+
+test "command tail match requires an identity-length prefix" {
+    try std.testing.expect(commandTailMatch("Ran zig build test --release", "zig build test --release --verbose") != null);
+    try std.testing.expect(commandTailMatch("Ran head -6; echo done", "git status") == null);
+    try std.testing.expect(commandTailMatch("Ran x", "x") == null);
+    try std.testing.expect(commandTailMatch("", "anything") == null);
 }
 
 test "minimal command timeout uses its typed cause in the row and group" {

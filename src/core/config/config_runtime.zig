@@ -51,6 +51,10 @@ pub const Settings = struct {
     context: ?bool = null,
     fast_mode: ?bool = null,
     fast_mode_model_bound: ?bool = null,
+    /// Owned gateway provider slugs in preference order; null leaves routing
+    /// to the gateway. Freed in deinit.
+    provider_order: ?[][]const u8 = null,
+    provider_strict: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
@@ -78,6 +82,10 @@ pub const Settings = struct {
         self.permission_rules.deinit(alloc);
         if (self.review_model) |value| alloc.free(value);
         if (self.theme) |value| alloc.free(value);
+        if (self.provider_order) |order| {
+            for (order) |slug| alloc.free(@constCast(slug));
+            alloc.free(order);
+        }
         self.* = .{};
     }
 };
@@ -565,6 +573,28 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             };
         }
     }
+    if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
+        switch (parseProviderOrderList(alloc, order_override)) {
+            .ok => |maybe_order| {
+                if (maybe_order) |order| {
+                    if (settings.provider_order) |old| {
+                        for (old) |slug| alloc.free(@constCast(slug));
+                        alloc.free(old);
+                    }
+                    settings.provider_order = order;
+                }
+            },
+            .invalid => debug_trace.logf("config", "ignoring invalid FX_PROVIDER_ORDER value", .{}),
+        }
+    }
+    if (io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
+        const trimmed = std.mem.trim(u8, strict_override, " \t\r\n");
+        if (parseEnvBool(trimmed)) |strict| {
+            settings.provider_strict = strict;
+        } else if (trimmed.len > 0) {
+            debug_trace.logf("config", "ignoring invalid FX_PROVIDER_STRICT value", .{});
+        }
+    }
     if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
         const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
         if (trimmed.len > 0) {
@@ -593,6 +623,51 @@ const ParsedAdditionalDirectories = struct {
     canonical: [][]u8,
     sources: [][]u8,
 };
+
+pub const ProviderOrderParse = union(enum) {
+    /// Owned slice; null when the input held no slugs. Caller frees each slug
+    /// and the slice.
+    ok: ?[][]const u8,
+    invalid,
+};
+
+/// Parses a comma-separated gateway provider list ("azure, anthropic") into
+/// validated, deduplicated slugs. Caller owns the returned memory.
+pub fn parseProviderOrderList(alloc: Allocator, raw: []const u8) ProviderOrderParse {
+    const result = parseProviderOrderListInner(alloc, raw) catch return .invalid;
+    return .{ .ok = result };
+}
+
+fn parseProviderOrderListInner(alloc: Allocator, raw: []const u8) !?[][]const u8 {
+    var slugs: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (slugs.items) |slug| alloc.free(@constCast(slug));
+        slugs.deinit(alloc);
+    }
+    var tokenizer = std.mem.tokenizeScalar(u8, raw, ',');
+    while (tokenizer.next()) |token| {
+        const slug = std.mem.trim(u8, token, " \t\r\n");
+        if (slug.len == 0) continue;
+        if (!settings_store.validateProviderSlug(slug)) return error.InvalidProviderSlug;
+        if (slugs.items.len >= settings_store.max_provider_order_entries) return error.TooManyProviderSlugs;
+        for (slugs.items) |existing| {
+            if (std.mem.eql(u8, existing, slug)) return error.DuplicateProviderSlug;
+        }
+        const owned = try alloc.dupe(u8, slug);
+        errdefer alloc.free(@constCast(owned));
+        try slugs.append(alloc, owned);
+    }
+    if (slugs.items.len == 0) return null;
+    return try slugs.toOwnedSlice(alloc);
+}
+
+fn parseEnvBool(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    return null;
+}
 
 fn parseAdditionalDirectories(
     alloc: Allocator,
@@ -1454,7 +1529,7 @@ fn parseSettingsValueForLayer(
         tolerate_non_object_user_containers,
         parse_workspace_statusline,
     );
-    try parseProjectSafeFields(&settings, root);
+    try parseProjectSafeFields(&settings, alloc, root);
 
     return settings;
 }
@@ -1666,7 +1741,42 @@ fn parseProfileOnlyFields(
     }
 }
 
-fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
+fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
+    if (root.object.get("provider_order")) |order_value| {
+        if (order_value != .array) return error.InvalidProviderOrderType;
+        const items = order_value.array.items;
+        // An empty array explicitly clears an inherited routing list.
+        if (items.len > settings_store.max_provider_order_entries) {
+            return error.InvalidProviderOrderValue;
+        }
+        var order = try alloc.alloc([]const u8, items.len);
+        errdefer alloc.free(order);
+        var filled: usize = 0;
+        errdefer for (order[0..filled]) |slug| alloc.free(@constCast(slug));
+        for (items, 0..) |item, index| {
+            if (item != .string or !settings_store.validateProviderSlug(item.string)) {
+                return error.InvalidProviderOrderValue;
+            }
+            for (items[0..index]) |previous| {
+                if (previous == .string and std.mem.eql(u8, item.string, previous.string)) {
+                    return error.InvalidProviderOrderValue;
+                }
+            }
+            order[index] = try alloc.dupe(u8, item.string);
+            filled += 1;
+        }
+        if (settings.provider_order) |old| {
+            for (old) |slug| alloc.free(@constCast(slug));
+            alloc.free(old);
+        }
+        settings.provider_order = order;
+    }
+
+    if (root.object.get("provider_strict")) |strict_value| {
+        if (strict_value != .bool) return error.InvalidProviderStrictType;
+        settings.provider_strict = strict_value.bool;
+    }
+
     if (root.object.get("max_agent_steps")) |max_agent_steps_value| {
         const value = max_agent_steps_value;
         if (value != .integer) return error.InvalidMaxAgentStepsType;
@@ -1706,6 +1816,15 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
+    if (incoming.provider_order) |value| {
+        if (target.provider_order) |old| {
+            for (old) |slug| alloc.free(@constCast(slug));
+            alloc.free(old);
+        }
+        target.provider_order = value;
+        incoming.provider_order = null;
+    }
+    if (incoming.provider_strict) |value| target.provider_strict = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
     if (incoming.session_titles) |value| target.session_titles = value;
@@ -2108,6 +2227,158 @@ test "loadMergedSettings merges project defaults before profile layers" {
     try std.testing.expectEqualStrings("override-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
+}
+
+test "provider routing settings merge across layers with project defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "project-only");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    const project_only_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "project-only");
+    defer std.testing.allocator.free(project_only_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"provider_order\":[\"bedrock\",\"anthropic\"],\"provider_strict\":true,\"workspaces\":{{\"{s}\":{{\"provider_order\":[\"vertex\"],\"provider_strict\":false}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"provider_order\":[\"azure\",\"openai\"]}");
+    try writeFixtureFile(tmp.dir, "project-only/.fx.json", "{\"provider_order\":[\"azure\",\"openai\"],\"provider_strict\":true}");
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    const order = settings.provider_order.?;
+    try std.testing.expectEqual(@as(usize, 1), order.len);
+    try std.testing.expectEqualStrings("vertex", order[0]);
+    try std.testing.expectEqual(false, settings.provider_strict.?);
+
+    // Project defaults fill in only when neither the profile nor the workspace
+    // sets routing, so this case needs its own home without profile values.
+    var project_settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, project_only_root);
+    defer project_settings.deinit(std.testing.allocator);
+
+    const inherited_order = project_settings.provider_order.?;
+    try std.testing.expectEqual(@as(usize, 2), inherited_order.len);
+    try std.testing.expectEqualStrings("bedrock", inherited_order[0]);
+    try std.testing.expectEqual(true, project_settings.provider_strict.?);
+}
+
+test "provider routing project defaults apply when profile is silent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"provider_order\":[\"azure\",\"openai\"],\"provider_strict\":true}");
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    const order = settings.provider_order.?;
+    try std.testing.expectEqual(@as(usize, 2), order.len);
+    try std.testing.expectEqualStrings("azure", order[0]);
+    try std.testing.expectEqualStrings("openai", order[1]);
+    try std.testing.expectEqual(true, settings.provider_strict.?);
+}
+
+test "provider routing empty list clears an inherited order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"provider_order\":[\"bedrock\"],\"workspaces\":{{\"{s}\":{{\"provider_order\":[]}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    const order = settings.provider_order orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), order.len);
+}
+
+test "parseProviderOrderList validates trims and deduplicates slugs" {
+    const alloc = std.testing.allocator;
+
+    const parsed = parseProviderOrderList(alloc, " azure, anthropic ,bedrock");
+    const order = switch (parsed) {
+        .ok => |maybe| maybe orelse return error.TestExpectedEqual,
+        .invalid => return error.TestExpectedEqual,
+    };
+    defer {
+        for (order) |slug| alloc.free(@constCast(slug));
+        alloc.free(order);
+    }
+    try std.testing.expectEqual(@as(usize, 3), order.len);
+    try std.testing.expectEqualStrings("azure", order[0]);
+    try std.testing.expectEqualStrings("bedrock", order[2]);
+
+    // Mixed-case gateway slugs like vertexAnthropic are valid.
+    const mixed = parseProviderOrderList(alloc, "vertexAnthropic,claudeaws");
+    const mixed_order = switch (mixed) {
+        .ok => |maybe| maybe orelse return error.TestExpectedEqual,
+        .invalid => return error.TestExpectedEqual,
+    };
+    defer {
+        for (mixed_order) |slug| alloc.free(@constCast(slug));
+        alloc.free(mixed_order);
+    }
+    try std.testing.expectEqualStrings("vertexAnthropic", mixed_order[0]);
+
+    switch (parseProviderOrderList(alloc, "azure,Bad Slug")) {
+        .ok => |maybe| {
+            if (maybe) |value| {
+                for (value) |slug| alloc.free(@constCast(slug));
+                alloc.free(value);
+            }
+            return error.TestExpectedEqual;
+        },
+        .invalid => {},
+    }
+    try std.testing.expect(parseProviderOrderList(alloc, "azure,azure") == .invalid);
+    switch (parseProviderOrderList(alloc, "  ")) {
+        .ok => |maybe| try std.testing.expect(maybe == null),
+        .invalid => return error.TestExpectedEqual,
+    }
+}
+
+test "parseEnvBool accepts common boolean spellings" {
+    try std.testing.expectEqual(true, parseEnvBool("1"));
+    try std.testing.expectEqual(true, parseEnvBool("TRUE"));
+    try std.testing.expectEqual(false, parseEnvBool("0"));
+    try std.testing.expectEqual(false, parseEnvBool("off"));
+    try std.testing.expect(parseEnvBool("maybe") == null);
+    try std.testing.expect(parseEnvBool("") == null);
 }
 
 test "context limits resolve command line over workspace and global profile values" {

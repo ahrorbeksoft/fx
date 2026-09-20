@@ -451,16 +451,31 @@ fn validatePendingToolReviewMessages(
 }
 
 pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions) !void {
-    const gateway_options = options.fast or options.prompt_caching;
+    const routing = options.provider_order.len > 0;
+    const gateway_options = options.fast or options.prompt_caching or routing;
     if (!gateway_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
         try writer.writeAll("\"gateway\":{");
-        if (options.fast) try writer.writeAll("\"speed\":\"fast\"");
+        var needs_comma = false;
+        if (options.fast) {
+            try writer.writeAll("\"speed\":\"fast\"");
+            needs_comma = true;
+        }
         if (options.prompt_caching) {
-            if (options.fast) try writer.writeByte(',');
+            if (needs_comma) try writer.writeByte(',');
             try writer.writeAll("\"caching\":\"auto\"");
+            needs_comma = true;
+        }
+        if (routing) {
+            if (needs_comma) try writer.writeByte(',');
+            try writer.writeAll(if (options.provider_strict) "\"only\":[" else "\"order\":[");
+            for (options.provider_order, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
         }
         try writer.writeByte('}');
     }
@@ -1699,6 +1714,35 @@ test "buildGatewayRequestBodyWithOptions serializes Gateway Fast provider option
     try std.testing.expect(parsed_automatic.value.object.get("reasoning") == null);
     try std.testing.expect(parsed_automatic.value.object.get("fast") == null);
     try std.testing.expect(parsed_automatic.value.object.get("providerOptions") == null);
+}
+
+test "buildGatewayRequestBodyWithOptions serializes provider routing options" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "question" },
+    };
+    const order = [_][]const u8{ "azure", "anthropic" };
+
+    const ordered = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .provider_order = &order,
+    }, .auto);
+    defer alloc.free(ordered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered, .{});
+    defer parsed.deinit();
+    const gateway = parsed.value.object.get("providerOptions").?.object.get("gateway").?.object;
+    try std.testing.expect(gateway.get("only") == null);
+    const order_items = gateway.get("order").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), order_items.len);
+    try std.testing.expectEqualStrings("azure", order_items[0].string);
+    try std.testing.expectEqualStrings("anthropic", order_items[1].string);
+
+    const strict = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .fast = true,
+        .provider_order = &order,
+        .provider_strict = true,
+    }, .auto);
+    defer alloc.free(strict);
+    try std.testing.expect(std.mem.find(u8, strict, "\"gateway\":{\"speed\":\"fast\",\"only\":[\"azure\",\"anthropic\"]}") != null);
 }
 
 test "buildGatewayRequestBodyWithOptions combines Gateway Fast and xai options" {

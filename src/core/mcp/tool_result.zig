@@ -104,12 +104,12 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         },
         .input_required => |required| blk: {
             const input_requests_json = try mrtr.renderRequests(alloc, required.requests);
-            errdefer alloc.free(input_requests_json);
+            errdefer mem_utils.free(alloc, input_requests_json);
             const request_state_json = if (required.request_state_json) |state|
                 try alloc.dupe(u8, state)
             else
                 null;
-            errdefer if (request_state_json) |state| alloc.free(state);
+            errdefer if (request_state_json) |state| mem_utils.free(alloc, state);
             const raw = try render_input_required(
                 alloc,
                 input_requests_json,
@@ -214,7 +214,7 @@ fn legacy_url_required(
         required,
         .{},
     );
-    errdefer alloc.free(input_requests_json);
+    errdefer mem_utils.free(alloc, input_requests_json);
     const raw = try render_input_required(alloc, input_requests_json, null);
     defer alloc.free(raw);
     return .{

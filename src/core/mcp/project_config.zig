@@ -10,6 +10,7 @@ const mcp_contract = @import("mcp_contract.zig");
 const startup_admission = @import("startup_admission.zig");
 const streamable_http = @import("streamable_http.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const McpAuthConfig = mcp_contract.McpAuthConfig;
@@ -480,7 +481,7 @@ fn parseWorkspaceJsonInternal(
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 const server_name = try alloc.dupe(u8, entry.key_ptr.*);
-                errdefer alloc.free(server_name);
+                errdefer mem_utils.free(alloc, server_name);
                 try result.diagnostics.append(alloc, .{
                     .server_name = server_name,
                     .cause = .invalid_entry,
@@ -520,10 +521,10 @@ pub fn expandApprovedWorkspaceConfigs(
             continue;
         };
         const server_name = try alloc.dupe(u8, config.name);
-        errdefer alloc.free(server_name);
+        errdefer mem_utils.free(alloc, server_name);
         switch (failure) {
             .missing => |missing| {
-                errdefer alloc.free(missing.variable_name);
+                errdefer mem_utils.free(alloc, missing.variable_name);
                 try result.diagnostics.append(alloc, .{
                     .server_name = server_name,
                     .environment_variable = missing.variable_name,
@@ -750,7 +751,7 @@ pub fn parseChoices(
     for (approved) |name| {
         if (containsName(rejected, name)) {
             const server_name = try alloc.dupe(u8, name);
-            errdefer alloc.free(server_name);
+            errdefer mem_utils.free(alloc, server_name);
             try diagnostics.append(alloc, .{
                 .server_name = server_name,
                 .cause = .approved_rejected_overlap,
@@ -994,7 +995,7 @@ fn parseServerEntry(
         const header_env = try parseRemoteHeaderEnv(alloc, object);
         errdefer freeHttpHeaderEnv(alloc, header_env);
         const bearer_token_env = try parseOptionalOwnedString(alloc, object, "bearer_token_env");
-        errdefer if (bearer_token_env) |field| alloc.free(field);
+        errdefer if (bearer_token_env) |field| mem_utils.free(alloc, field);
         if (bearer_token_env) |field| if (!isValidEnvName(field)) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
         var auth = parseProfileAuth(alloc, object) catch |err| switch (err) {
             error.OutOfMemory => return failServerConfig(error.OutOfMemory),
@@ -1002,7 +1003,7 @@ fn parseServerEntry(
         };
         errdefer if (auth) |*field| field.deinit(alloc);
         const owned_name = try alloc.dupe(u8, name);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_url = try alloc.dupe(u8, url_value.string);
         return .{
             .name = owned_name,
@@ -1098,7 +1099,7 @@ fn parseRemoteHeaders(
             return error.McpConfigInvalidHeaders;
         }
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_value = try alloc.dupe(u8, entry.value_ptr.*.string);
         headers.appendAssumeCapacity(.{ .name = owned_name, .value = owned_value });
     }
@@ -1120,9 +1121,9 @@ fn parseRemoteHeaderEnv(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttp
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, previous.name)) return error.McpConfigInvalidHeaders;
         }
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_env = try alloc.dupe(u8, entry.value_ptr.*.string);
-        errdefer alloc.free(owned_env);
+        errdefer mem_utils.free(alloc, owned_env);
         try refs.append(alloc, .{
             .name = owned_name,
             .env = owned_env,
@@ -1222,11 +1223,11 @@ fn parseCommandSpec(alloc: Allocator, object: std.json.ObjectMap) !ParsedCommand
                 return error.McpMissingCommand;
             }
             const command = try alloc.dupe(u8, command_value.array.items[0].string);
-            errdefer alloc.free(command);
+            errdefer mem_utils.free(alloc, command);
             const args = try alloc.alloc([]u8, command_value.array.items.len - 1);
-            errdefer alloc.free(args);
+            errdefer mem_utils.free(alloc, args);
             var initialized: usize = 0;
-            errdefer for (args[0..initialized]) |arg| alloc.free(arg);
+            errdefer for (args[0..initialized]) |arg| mem_utils.free(alloc, arg);
             for (command_value.array.items[1..], 0..) |field, index| {
                 if (field != .string) return error.McpMissingCommand;
                 args[index] = try alloc.dupe(u8, field.string);
@@ -1257,9 +1258,9 @@ fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .string) return error.McpConfigInvalidEnvironment;
         const key = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(key);
+        errdefer mem_utils.free(alloc, key);
         const entry_value = try alloc.dupe(u8, entry.value_ptr.*.string);
-        errdefer alloc.free(entry_value);
+        errdefer mem_utils.free(alloc, entry_value);
         try vars.append(alloc, .{
             .key = key,
             .value = entry_value,
@@ -1271,9 +1272,9 @@ fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
 fn parseStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
     if (value != .array) return error.McpConfigInvalidStringArray;
     const items = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(items);
+    errdefer mem_utils.free(alloc, items);
     var initialized: usize = 0;
-    errdefer for (items[0..initialized]) |item| alloc.free(item);
+    errdefer for (items[0..initialized]) |item| mem_utils.free(alloc, item);
     for (value.array.items, 0..) |field, index| {
         if (field != .string) return error.McpConfigInvalidStringArray;
         items[index] = try alloc.dupe(u8, field.string);
@@ -1315,15 +1316,15 @@ fn appendOwnedName(
     name: []const u8,
 ) !void {
     const owned = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned);
+    errdefer mem_utils.free(alloc, owned);
     try output.append(alloc, owned);
 }
 
 fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     const result = try alloc.alloc([]u8, values.len);
-    errdefer alloc.free(result);
+    errdefer mem_utils.free(alloc, result);
     var initialized: usize = 0;
-    errdefer for (result[0..initialized]) |value| alloc.free(value);
+    errdefer for (result[0..initialized]) |value| mem_utils.free(alloc, value);
     for (values, 0..) |value, index| {
         result[index] = try alloc.dupe(u8, value);
         initialized += 1;

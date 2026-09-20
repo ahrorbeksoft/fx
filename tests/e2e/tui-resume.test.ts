@@ -30,6 +30,7 @@ import {
   isVolatileTokenStatusRow,
   paneExitMatches,
   startFakeGateway,
+  startUpgradeServer,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -79,62 +80,6 @@ function sessionIdFromHome(home: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function startUpgradeServer(
-  root: string,
-  argvLogPath: string,
-  options: {
-    revision?: string;
-  } = {},
-): { baseUrl: string; stop: () => void } {
-  const artifactDir = join(root, "release-artifact");
-  const wrapperPath = join(artifactDir, "fx");
-  const archivePath = join(root, "fx.tar.gz");
-  mkdirSync(artifactDir);
-  const script = `#!/bin/sh
-{
-  printf '%s' "$0"
-  for arg in "$@"; do
-    printf '\\t%s' "$arg"
-  done
-  printf '\\n'
-} >> ${shellQuote(argvLogPath)}
-exec ${shellQuote(FX_BIN)} "$@"
-`;
-  writeFileSync(wrapperPath, script);
-  chmodSync(wrapperPath, 0o755);
-  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
-  if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
-
-  const archive = readFileSync(archivePath);
-  const checksum = createHash("sha256").update(archive).digest("hex");
-  const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
-  const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
-  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch(request) {
-      const path = new URL(request.url).pathname;
-      if (path === "/latest.txt") return new Response("v9.9.9\n");
-      if (path === "/dev.json") {
-        return Response.json({ version: "9.9.9", commit: revision });
-      }
-      if (path === stableArchiveRoute || path === devArchiveRoute) {
-        return new Response(archive);
-      }
-      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
-        return new Response(`${checksum}\n`);
-      }
-      return new Response("not found", { status: 404 });
-    },
-  });
-  return {
-    baseUrl: `http://127.0.0.1:${server.port}`,
-    stop: () => server.stop(true),
-  };
 }
 
 function gatewayEnv(
@@ -7625,3 +7570,97 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     else console.error(`retained remembered-continuation artifacts at ${root}`);
   }
 }, 150_000);
+
+test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after the session moved workspaces", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-reclip-")));
+  const home = join(root, "home");
+  const workspacePath = join(root, "workspace");
+  mkdirSync(workspacePath, { recursive: true });
+  const workspace = realpathSync(workspacePath);
+  const sessionId = "moved-workspace-reclip";
+  const sessionDir = join(home, ".fx", "sessions", sessionId);
+  mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+
+  // The session was created in a workspace that no longer applies, then later
+  // lived in `workspace`: origin and current roots differ, which used to
+  // blank the replay root and withhold every absolute-path command's reclip
+  // metadata.
+  const oldWorkspace = join(root, "old-workspace");
+  const tail = "a".repeat(60);
+  const command = `cd ${workspace}/alpha && printf '${tail}' && printf 'done'`;
+  writeFileSync(join(sessionDir, "session.json"), JSON.stringify({
+    schema_version: 2,
+    id: sessionId,
+    created_at_ms: 1,
+    updated_at_ms: 2,
+    origin_workspace_root: oldWorkspace,
+    workspace_root: workspace,
+    conversation_language: "en",
+    history_len: 1,
+    context_history_start: 0,
+    history: [{
+      kind: "assistant",
+      user: { text: "RECLIP_MOVED_REQUEST", images: [] },
+      assistant: "RECLIP_MOVED_REPLY",
+      execution: {
+        schema_version: 2,
+        tool_steps: [{
+          assistant: null,
+          tool_calls: [{
+            id: "call-long",
+            name: "shell",
+            arguments_json: JSON.stringify({ action: "run", command, yield_time_ms: 30_000 }),
+            provider_result: null,
+          }],
+          tool_results: [{
+            tool_call_id: "call-long",
+            tool_name: "shell",
+            status: "success",
+            output: "ok",
+            output_handle: null,
+            preview: null,
+            output_bytes: 2,
+            stored_output_bytes: 2,
+            truncated: false,
+            provider_native: false,
+            created_at_ms: 2,
+            permission_feedback: [],
+          }],
+        }],
+        files: [],
+        steering: [],
+      },
+    }],
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+  }) + "\n", { mode: 0o600 });
+
+  const gateway = startFakeGateway([fakeGatewayFinalText("UNUSED")]);
+  const stderrPath = join(root, "stderr.log");
+  let active: TmuxSession | null = null;
+  try {
+    active = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume ${sessionId}`,
+      cwd: workspace,
+      width: 200,
+      height: 40,
+      env: gatewayEnv(home, gateway),
+      stderrPath,
+    });
+    const scrollback = await waitForScrollback(active, "RECLIP_MOVED_REPLY");
+    // The replayed row abbreviates against the live workspace and reclips to
+    // the live width instead of keeping the frozen compact-bound marker.
+    const row = scrollback.split("\n").find((line) => line.includes("Ran cd ./alpha"));
+    expect(row).toBeDefined();
+    expect(row!).toContain(tail);
+    expect(row!).not.toContain("...");
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    active = null;
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    await active?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);

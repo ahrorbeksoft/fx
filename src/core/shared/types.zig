@@ -1586,6 +1586,10 @@ pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     generation_id: ?[]const u8 = null,
+    /// Owned gateway provider slug that actually served the request (the
+    /// gateway's routing finalProvider/resolvedProvider). Null when the
+    /// provider did not report routing metadata.
+    resolved_provider: ?[]const u8 = null,
     billing: ?ProviderBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.
     generation_metadata_invalid: bool = false,

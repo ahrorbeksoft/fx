@@ -4013,6 +4013,9 @@ fn writeNetworkRecordBody(
             if (completed.completion.generation_id) |generation_id| {
                 try writer.print(" · generation: {s}", .{generation_id});
             }
+            if (completed.completion.resolved_provider) |resolved| {
+                try writer.print(" · served-by: {s}", .{resolved});
+            }
             try writeUsageTokens(writer, completed.completion.usage);
         },
         .failed => |*failure| {
@@ -6079,6 +6082,8 @@ pub fn prepareManualCompactionContinuation(
     );
     var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode);
     provider_options.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+    provider_options.provider_order = config.provider_order;
+    provider_options.provider_strict = config.provider_strict;
     return .{
         .request = .{
             .model = model,
@@ -6753,10 +6758,8 @@ fn processQueuedPromptLoop(
     var compaction_history = job.history;
     var compacted_suffix_len: usize = 0;
     var compaction_count = latestCompactionCount(job.history);
-    var request_token_calibration: ?struct {
-        model: []const u8,
-        cost: runtime_prompt_context.RequestTokenCalibration,
-    } = null;
+    // Request-token calibration lives on the agent so the first request of a
+    // new turn still calibrates from the previous turn's exact usage.
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -7246,6 +7249,8 @@ fn processQueuedPromptLoop(
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+            provider_opts.provider_order = config.provider_order;
+            provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
@@ -7288,8 +7293,8 @@ fn processQueuedPromptLoop(
             )) |request_body| {
                 prepared_request_body = request_body;
                 const measured_request_cost = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, request_body, request_data);
-                const applicable_calibration = if (request_token_calibration) |calibration|
-                    if (std.mem.eql(u8, calibration.model, gateway_model) and calibration.cost.applies(measured_request_cost))
+                const applicable_calibration = if (agent.request_token_calibration) |*calibration|
+                    if (std.mem.eql(u8, calibration.modelSlice(), gateway_model) and calibration.cost.applies(measured_request_cost))
                         calibration.cost
                     else
                         null
@@ -7508,7 +7513,7 @@ fn processQueuedPromptLoop(
                                 "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
                                 .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
                             );
-                            request_token_calibration = null;
+                            agent.request_token_calibration = null;
                             skip_next_preflight_refresh = true;
                             installed_compaction = true;
                             break :compact_attempt;
@@ -8072,6 +8077,20 @@ fn processQueuedPromptLoop(
             }
             if (streamCompletionPtr(&stream_result)) |completion| {
                 agent.observeUsage(completion.usage);
+                // The completion buffer is step-scoped, so no cross-step
+                // dedupe: each completion reports its serving provider once.
+                // The push_event callback takes ownership of the payload on
+                // every outcome, including error returns, so this scope never
+                // frees `owned` after the call.
+                if (completion.resolved_provider) |provider| {
+                    if (std.heap.c_allocator.dupe(u8, provider)) |owned| {
+                        deps.push_event(deps.ctx, .{ .provider_resolved = owned }) catch |err| {
+                            debug_trace.logf("agent", "provider_resolved event dropped err={s}", .{@errorName(err)});
+                        };
+                    } else |_| {
+                        debug_trace.logf("agent", "provider_resolved event dropped err=OutOfMemory", .{});
+                    }
+                }
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,
                     deps.tool_registry,
@@ -8908,16 +8927,13 @@ fn processQueuedPromptLoop(
         } else null;
         if (successful_request_cost) |request_cost| {
             if (completion.usage.input_tokens) |exact_input_tokens| {
-                request_token_calibration = .{
-                    .model = successful_gateway_model,
-                    .cost = .{
-                        .request = request_cost,
-                        .exact_input_tokens = @intCast(@min(
-                            exact_input_tokens,
-                            std.math.maxInt(usize),
-                        )),
-                    },
-                };
+                agent.storeRequestTokenCalibration(successful_gateway_model, .{
+                    .request = request_cost,
+                    .exact_input_tokens = @intCast(@min(
+                        exact_input_tokens,
+                        std.math.maxInt(usize),
+                    )),
+                });
             }
         }
         const tool_admission = types.authoritativeToolAdmission(completion);

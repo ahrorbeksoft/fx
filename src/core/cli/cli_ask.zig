@@ -297,6 +297,9 @@ pub const PromptRunResult = struct {
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
     step_count: usize = 0,
+    /// Owned slug of the provider that served the last gateway request;
+    /// empty when the provider did not report routing metadata.
+    resolved_provider: []u8 = &.{},
     error_code: ?[]const u8 = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
@@ -307,6 +310,7 @@ pub const PromptRunResult = struct {
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.model.len > 0) alloc.free(self.model);
+        if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
         freeToolCallRecords(alloc, self.tool_calls);
     }
@@ -336,6 +340,8 @@ const AskOptions = struct {
     model_override: ?[]u8 = null,
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
+    provider_order_override: ?[][]const u8 = null,
+    provider_strict_override: ?bool = null,
     image_paths: std.ArrayList([]u8) = .empty,
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
@@ -356,6 +362,10 @@ const AskOptions = struct {
         self.images.deinit(alloc);
         if (self.system_prompt_override) |s| alloc.free(s);
         if (self.model_override) |m| alloc.free(m);
+        if (self.provider_order_override) |order| {
+            for (order) |slug| alloc.free(@constCast(slug));
+            if (order.len > 0) alloc.free(order);
+        }
     }
 };
 
@@ -472,6 +482,8 @@ const RunOptions = struct {
     model_override: ?[]const u8 = null,
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
+    provider_order_override: ?[]const []const u8 = null,
+    provider_strict_override: ?bool = null,
     deps: RunDeps,
 };
 
@@ -556,6 +568,13 @@ const AskContext = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    /// Borrowed gateway provider routing for this run; startup state owns the
+    /// backing memory.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
+    /// Owned slug of the provider that served the latest gateway request this
+    /// run, reported by the gateway's routing metadata.
+    resolved_provider: ?[]u8 = null,
     first_call_tool_choice: types.ToolChoice = .auto,
     permission_mode: PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
@@ -772,6 +791,7 @@ const AskContext = struct {
             freeToolCallRecord(self.alloc, record);
         }
         self.tool_call_records.deinit(self.alloc);
+        if (self.resolved_provider) |provider| self.alloc.free(provider);
         self.loaded_skills.deinit(self.alloc);
     }
 
@@ -1023,6 +1043,8 @@ const AskContext = struct {
             .agent_step_limit = self.agent_step_limit,
             .fast_mode = self.fast_mode,
             .effort = self.effort,
+            .provider_order = if (self.provider == .gateway) self.provider_order else &.{},
+            .provider_strict = self.provider == .gateway and self.provider_strict,
             .first_call_tool_choice = self.first_call_tool_choice,
             .permission_mode = self.permission_mode,
             .permission_grants = &.{},
@@ -1330,6 +1352,8 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .model_override = options.model_override,
         .effort_override = options.effort_override,
         .fast_override = options.fast_override,
+        .provider_order_override = options.provider_order_override,
+        .provider_strict_override = options.provider_strict_override,
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
@@ -1574,6 +1598,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
     ctx.fast_mode = startup.fast_mode;
+    ctx.provider_order = startup.provider_order;
+    ctx.provider_strict = startup.provider_strict;
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
@@ -1626,6 +1652,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         // Default fast mode applies to the compiled default model only; an
         // explicit model override drops it unless --fast restores it.
         ctx.fast_mode = false;
+    }
+    if (options.provider_order_override) |order| {
+        ctx.provider_order = order;
+    }
+    if (options.provider_strict_override) |strict| {
+        ctx.provider_strict = strict;
     }
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
@@ -1890,6 +1922,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .cancel_flag = ctx.cancelFlag(),
         .fast_mode = ctx.fast_mode,
         .effort = ctx.effort,
+        .provider_order = if (ctx.provider == .gateway) ctx.provider_order else &.{},
+        .provider_strict = ctx.provider == .gateway and ctx.provider_strict,
         .first_call_tool_choice = ctx.first_call_tool_choice,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
@@ -2015,6 +2049,11 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     errdefer if (final_output.len > 0) alloc.free(final_output);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
+    const resolved_provider: []u8 = if (ctx.resolved_provider) |provider|
+        try alloc.dupe(u8, provider)
+    else
+        @constCast(&.{});
+    errdefer if (resolved_provider.len > 0) alloc.free(resolved_provider);
     const session_id = if (ctx.writable) |writable|
         try alloc.dupe(u8, writable.active_id)
     else
@@ -2029,6 +2068,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .final_output = final_output,
         .interrupted = ctx.processInterruptRequested(),
         .model = model,
+        .resolved_provider = resolved_provider,
         .session_id = session_id,
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
@@ -3163,6 +3203,10 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     switch (event) {
         .clear_route_recovery_status => ctx.last_recovery_status = null,
+        .provider_resolved => |slug| {
+            if (ctx.resolved_provider) |old| ctx.alloc.free(old);
+            ctx.resolved_provider = try ctx.alloc.dupe(u8, slug);
+        },
         .finish_prompt => |finished| {
             ctx.final_output.clearRetainingCapacity();
             if (finished.terminal_outcome == .completed) switch (finished.turn) {
@@ -3814,6 +3858,20 @@ fn resolveAskSubagentAuthority(
     );
 }
 
+/// Parses one `--provider-order` value for `fx ask`, replacing any earlier
+/// occurrence. The returned slice is owned by `alloc`.
+fn parseAskProviderOrder(alloc: Allocator, raw: []const u8, previous: ?[][]const u8) ![][]const u8 {
+    const parsed: [][]const u8 = switch (config_runtime.parseProviderOrderList(alloc, raw)) {
+        .ok => |maybe| maybe orelse return error.InvalidAskArgs,
+        .invalid => return error.InvalidAskArgs,
+    };
+    if (previous) |old| {
+        for (old) |slug| alloc.free(@constCast(slug));
+        if (old.len > 0) alloc.free(old);
+    }
+    return parsed;
+}
+
 fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: StdinSource) !AskOptions {
     var opts: AskOptions = .{ .prompt = &.{} };
     errdefer opts.deinit(alloc);
@@ -3853,6 +3911,17 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             if (opts.fast_override != null and opts.fast_override.? != enabled)
                 return error.InvalidAskArgs;
             opts.fast_override = enabled;
+        } else if (std.mem.eql(u8, arg, "--provider-order")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            opts.provider_order_override = try parseAskProviderOrder(alloc, args[i], opts.provider_order_override);
+        } else if (std.mem.startsWith(u8, arg, "--provider-order=")) {
+            opts.provider_order_override = try parseAskProviderOrder(alloc, arg["--provider-order=".len..], opts.provider_order_override);
+        } else if (std.mem.eql(u8, arg, "--provider-strict") or std.mem.eql(u8, arg, "--no-provider-strict")) {
+            const strict = std.mem.eql(u8, arg, "--provider-strict");
+            if (opts.provider_strict_override != null and opts.provider_strict_override.? != strict)
+                return error.InvalidAskArgs;
+            opts.provider_strict_override = strict;
         } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "--resume-id")) {
             if (opts.resume_target != null) return error.InvalidAskArgs;
             const exact_id = std.mem.eql(u8, arg, "--resume-id");
@@ -4042,6 +4111,12 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     try out.writer.print(",\"exit_code\":{d}", .{result.exit_code});
     try out.writer.writeAll(",\"model\":");
     try std.json.Stringify.value(result.model, .{}, &out.writer);
+    try out.writer.writeAll(",\"resolved_provider\":");
+    if (result.resolved_provider.len > 0) {
+        try std.json.Stringify.value(result.resolved_provider, .{}, &out.writer);
+    } else {
+        try out.writer.writeAll("null");
+    }
     try out.writer.writeAll(",\"session_id\":");
     try std.json.Stringify.value(result.session_id, .{}, &out.writer);
     try out.writer.print(",\"steps\":{d}", .{result.step_count});
@@ -5446,6 +5521,33 @@ test "parse options preserves model effort and fast overrides" {
     try std.testing.expectEqualStrings("second/model", last_model.model_override.?);
 }
 
+test "parse options accepts provider routing flags and rejects malformed values" {
+    const alloc = std.testing.allocator;
+
+    var options = try parseOptionsWithStdin(alloc, &.{ "--provider-order", "azure,anthropic", "--provider-strict", "hello" }, .tty);
+    defer options.deinit(alloc);
+    const order = options.provider_order_override.?;
+    try std.testing.expectEqual(@as(usize, 2), order.len);
+    try std.testing.expectEqualStrings("azure", order[0]);
+    try std.testing.expectEqualStrings("anthropic", order[1]);
+    try std.testing.expectEqual(@as(?bool, true), options.provider_strict_override);
+    try std.testing.expectEqualStrings("hello", options.prompt);
+
+    var equals_form = try parseOptionsWithStdin(alloc, &.{ "--provider-order=bedrock", "--no-provider-strict", "hello" }, .tty);
+    defer equals_form.deinit(alloc);
+    try std.testing.expectEqualStrings("bedrock", equals_form.provider_order_override.?[0]);
+    try std.testing.expectEqual(@as(?bool, false), equals_form.provider_strict_override);
+
+    var defaulted = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer defaulted.deinit(alloc);
+    try std.testing.expectEqual(@as(?[][]const u8, null), defaulted.provider_order_override);
+    try std.testing.expectEqual(@as(?bool, null), defaulted.provider_strict_override);
+
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--provider-order"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--provider-order=Bad Slug", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--provider-strict", "--no-provider-strict", "hello" }, .tty));
+}
+
 test "parse options rejects invalid model effort and fast flag forms" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--model"}, .tty));
@@ -5826,14 +5928,14 @@ test "stdin prompt errors keep exact structured names" {
     const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded");
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
     const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed");
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
     );
 }
@@ -5850,7 +5952,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
 }
@@ -5868,7 +5970,7 @@ test "unresolved image capability has actionable text and stable JSON code" {
     );
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
         json,
     );
 }
@@ -5899,7 +6001,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -7201,6 +7303,34 @@ test "final ask json keeps shell tool call shape and adds command result" {
     try std.testing.expectEqual(@as(i64, 2), command_result.get("stdout_bytes").?.integer);
 }
 
+test "final ask json reports the resolved provider or null" {
+    const alloc = std.testing.allocator;
+
+    const routed = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+        .model = try alloc.dupe(u8, "anthropic/claude-sonnet-5"),
+        .resolved_provider = try alloc.dupe(u8, "bedrock"),
+    };
+    defer routed.deinit(alloc);
+    const routed_json = try renderFinalJsonResult(alloc, routed);
+    defer alloc.free(routed_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, routed_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("bedrock", parsed.value.object.get("resolved_provider").?.string);
+
+    const unrouted = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+    };
+    defer unrouted.deinit(alloc);
+    const unrouted_json = try renderFinalJsonResult(alloc, unrouted);
+    defer alloc.free(unrouted_json);
+    var parsed_unrouted = try std.json.parseFromSlice(std.json.Value, alloc, unrouted_json, .{});
+    defer parsed_unrouted.deinit();
+    try std.testing.expect(parsed_unrouted.value.object.get("resolved_provider").? == .null);
+}
+
 test "runWithDeps honors no-save by skipping ask session stores" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
@@ -7990,7 +8120,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -8007,7 +8137,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -8882,7 +9012,7 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
 }
@@ -9185,8 +9315,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
     };
 
     for (cases) |case| {
@@ -9239,7 +9369,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
 
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
-    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"session_id\":\""));
+    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"resolved_provider\":null,\"session_id\":\""));
     try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
